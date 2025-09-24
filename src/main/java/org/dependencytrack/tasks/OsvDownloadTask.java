@@ -24,11 +24,13 @@ import alpine.event.framework.LoggableSubscriber;
 import alpine.model.ConfigProperty;
 import com.github.packageurl.MalformedPackageURLException;
 import com.github.packageurl.PackageURL;
+import org.apache.http.HttpEntity;
 import org.apache.http.HttpStatus;
 import org.apache.http.StatusLine;
 import org.apache.http.client.methods.CloseableHttpResponse;
 import org.apache.http.client.methods.HttpGet;
 import org.apache.http.client.methods.HttpUriRequest;
+import org.apache.http.util.EntityUtils;
 import org.dependencytrack.common.HttpClientPool;
 import org.dependencytrack.event.IndexEvent;
 import org.dependencytrack.event.OsvMirrorEvent;
@@ -44,15 +46,22 @@ import org.dependencytrack.parser.osv.model.OsvAdvisory;
 import org.dependencytrack.parser.osv.model.OsvAffectedPackage;
 import org.dependencytrack.persistence.QueryManager;
 import org.dependencytrack.util.CvssUtil;
+import org.json.JSONException;
 import org.json.JSONObject;
+import org.json.JSONTokener;
 import org.slf4j.MDC;
 
-import java.io.BufferedReader;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.InputStreamReader;
+import java.io.BufferedReader;
+import java.io.BufferedInputStream;
 import java.net.URLEncoder;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.StandardCopyOption;
+import java.nio.file.StandardOpenOption;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
@@ -61,6 +70,7 @@ import java.util.List;
 import java.util.Optional;
 import java.util.Scanner;
 import java.util.Set;
+import java.util.regex.Pattern;
 import java.util.stream.Collectors;
 import java.util.zip.ZipEntry;
 import java.util.zip.ZipInputStream;
@@ -79,6 +89,10 @@ public class OsvDownloadTask implements LoggableSubscriber {
     private Set<String> ecosystems;
     private String osvBaseUrl;
     private boolean aliasSyncEnabled;
+    private long metricParseTime;
+    private long metricDownloadTime;
+
+    private static final long MAX_ZIP_BYTES = 500L * 1024 * 1024; // Max size for zip files 500 MiB
 
     public OsvDownloadTask() {
         try (final QueryManager qm = new QueryManager()) {
@@ -105,64 +119,131 @@ public class OsvDownloadTask implements LoggableSubscriber {
 
     @Override
     public void inform(Event e) {
-
         if (e instanceof OsvMirrorEvent) {
-
-            if (this.ecosystems != null && !this.ecosystems.isEmpty()) {
-                for (String ecosystem : this.ecosystems) {
-                    LOGGER.info("Updating datasource with Google OSV advisories for ecosystem " + ecosystem);
-                    String url = this.osvBaseUrl + URLEncoder.encode(ecosystem, StandardCharsets.UTF_8).replace("+", "%20")
-                            + "/all.zip";
-                    HttpUriRequest request = new HttpGet(url);
-                    try (var ignoredMdcOsvEcosystem = MDC.putCloseable("osvEcosystem", ecosystem);
-                         final CloseableHttpResponse response = HttpClientPool.getClient().execute(request)) {
-                        final StatusLine status = response.getStatusLine();
-                        if (status.getStatusCode() == HttpStatus.SC_OK) {
-                            try (InputStream in = response.getEntity().getContent();
-                                 ZipInputStream zipInput = new ZipInputStream(in)) {
-                                unzipFolder(zipInput);
-                            }
-                        } else {
-                            LOGGER.error("Download failed : " + status.getStatusCode() + ": " + status.getReasonPhrase());
-                        }
-                    } catch (Exception ex) {
-                        LOGGER.error("Exception while executing Http client request", ex);
-                    }
-                }
-            } else {
+            if (ecosystems == null || ecosystems.isEmpty()) {
                 LOGGER.info("Google OSV mirroring is disabled. No ecosystem selected.");
+                return;
+            }
+            final long start = System.currentTimeMillis();
+            ecosystems.forEach(this::processEcosystem);
+            final long end = System.currentTimeMillis();
+            LOGGER.info("Google OSV mirroring complete");
+            LOGGER.info("Time spent (d/l):   " + metricDownloadTime + " ms");
+            LOGGER.info("Time spent (parse): " + metricParseTime + " ms");
+            LOGGER.info("Time spent (total): " + (end - start) + " ms");
+        }
+    }
+
+    private void processEcosystem(String ecosystem) {
+        try (var ignoredMdcOsvEcosystem = MDC.putCloseable("osvEcosystem", ecosystem)) {
+            String url = this.osvBaseUrl + URLEncoder.encode(ecosystem, StandardCharsets.UTF_8).replace("+", "%20")
+                    + "/all.zip";
+            LOGGER.info("Initiating download of " + url);
+            final long downloadStart = System.currentTimeMillis();
+            Path tempFile = downloadZipDataFile(url, ecosystem);
+            if (tempFile != null) {
+                LOGGER.debug("Downloaded OSV advisories for " +  ecosystem + " into temp file at " + tempFile);
+                final long downloadEnd = System.currentTimeMillis();
+                metricDownloadTime += downloadEnd - downloadStart;
+                processZipTempFile(tempFile);
+            }
+        } catch (Exception ex) {
+            LOGGER.error("Exception while downloading/unzipping OSV data for " + ecosystem, ex);
+        }
+    }
+
+    private Path downloadZipDataFile(String url, String ecosystem) throws IOException, IllegalStateException {
+        final HttpUriRequest request = new HttpGet(url);
+        try (CloseableHttpResponse response = HttpClientPool.getClient().execute(request)) {
+            final StatusLine status = response.getStatusLine();
+            final HttpEntity entity = response.getEntity();
+            try {
+                LOGGER.info("Downloading...");
+                if (status.getStatusCode() != HttpStatus.SC_OK) {
+                    LOGGER.error("Download failed for: " + ecosystem + " - " +
+                            status.getStatusCode() + " " + status.getReasonPhrase());
+                    return null;
+                }
+                long contentLength = entity.getContentLength();
+                LOGGER.debug("HTTP contentLength for " + ecosystem + ": " + contentLength);
+
+                if (contentLength > MAX_ZIP_BYTES) {
+                    throw new IllegalStateException(
+                            String.format("ZIP too large for ecosystem %s: %d bytes (limit %d)",
+                                    ecosystem, contentLength, MAX_ZIP_BYTES));
+                }
+                final Path tempFile = Files.createTempFile("google-osv-download-" + ecosystem + "-", ".zip");
+                try (final InputStream in = response.getEntity().getContent()) {
+                    Files.copy(in, tempFile.toAbsolutePath(), StandardCopyOption.REPLACE_EXISTING);
+                    return tempFile.toAbsolutePath();
+                }
+            } finally {
+                EntityUtils.consumeQuietly(entity);
             }
         }
     }
 
+    private void processZipTempFile(Path tempFile) throws IOException {
+        final long start = System.currentTimeMillis();
+        if (Files.size(tempFile) <= 0) {
+            LOGGER.warn("Temporary OSV file is empty, skipping and deleting: " + tempFile.getFileName());
+            Files.delete(tempFile);
+            return;
+        }
+        LOGGER.info("Uncompressing " + tempFile.getFileName());
+        try (final var in = Files.newInputStream(tempFile, StandardOpenOption.DELETE_ON_CLOSE);
+             final var bufferedIn = new BufferedInputStream(in);
+             final var zipInput = new ZipInputStream(bufferedIn)) {
+            LOGGER.info("Parsing OSV advisory JSON files in " + tempFile.getFileName());
+            unzipFolder(zipInput);
+        }
+        final long end = System.currentTimeMillis();
+        metricParseTime += end - start;
+    }
+
     private void unzipFolder(ZipInputStream zipIn) throws IOException {
-
-        BufferedReader reader = new BufferedReader(new InputStreamReader(zipIn));
-        OsvAdvisoryParser parser = new OsvAdvisoryParser();
-        ZipEntry zipEntry = zipIn.getNextEntry();
-        while (zipEntry != null) {
-
-            String line = null;
-            StringBuilder out = new StringBuilder();
-            while ((line = reader.readLine()) != null) {
-                out.append(line);
+        final Pattern jsonPattern = Pattern.compile("\\.json$", Pattern.CASE_INSENSITIVE);
+        final OsvAdvisoryParser parser = new OsvAdvisoryParser();
+        ZipEntry zipEntry;
+        while ((zipEntry = zipIn.getNextEntry()) != null) {
+            try {
+                if (zipEntry.isDirectory()) {
+                    LOGGER.warn("Skipped directory: " + zipEntry.getName());
+                    continue;
+                }
+                final String entryName = zipEntry.getName();
+                if (!jsonPattern.matcher(entryName).find()) {
+                    LOGGER.warn("Skipped non-JSON entry: " + entryName);
+                    continue;
+                }
+                processJsonAdvisory(zipIn, parser, entryName);
+            } finally {
+                zipIn.closeEntry();
             }
-            JSONObject json = new JSONObject(out.toString());
-            String advisoryId = json.optString("id");
+        }
+    }
+
+    private void processJsonAdvisory(ZipInputStream zipIn, OsvAdvisoryParser parser, String entryName) {
+        try {
+            final BufferedReader reader = new BufferedReader(
+                    new InputStreamReader(zipIn, StandardCharsets.UTF_8), 8192
+            );
+            final JSONObject json = new JSONObject(new JSONTokener(reader));
+            final String advisoryId = json.optString("id", "unknown");
             try (var ignoredMdcVulnId = MDC.putCloseable(MDC_VULN_ID, advisoryId)) {
-                try {
-                    final OsvAdvisory osvAdvisory = parser.parse(json);
-                    if (osvAdvisory != null) {
-                        updateDatasource(osvAdvisory);
-                    }
-                } catch (RuntimeException e) {
-                    LOGGER.error("Failed to process advisory", e);
+                final OsvAdvisory osvAdvisory = parser.parse(json);
+                if (osvAdvisory != null) {
+                    updateDatasource(osvAdvisory);
+                    LOGGER.debug("Successfully processed advisory: " + advisoryId + " from entry: " + entryName);
+                } else {
+                    LOGGER.debug("Advisory from entry: " + entryName + " was not processed further (withdrawn or parsing error)");
                 }
             }
-            zipEntry = zipIn.getNextEntry();
-            reader = new BufferedReader(new InputStreamReader(zipIn));
+        } catch (JSONException e) {
+            LOGGER.error("JSON parsing error for entry: " + entryName, e);
+        } catch (RuntimeException e) {
+            LOGGER.error("Unexpected error processing entry: " + entryName, e);
         }
-        reader.close();
     }
 
     public void updateDatasource(final OsvAdvisory advisory) {
@@ -170,20 +251,20 @@ public class OsvDownloadTask implements LoggableSubscriber {
         try (QueryManager qm = new QueryManager()) {
 
             LOGGER.debug("Synchronizing Google OSV advisory: " + advisory.getId());
-            final Vulnerability vulnerability = mapAdvisoryToVulnerability(qm, advisory);
+            final Vulnerability vulnerability = mapAdvisoryToVulnerability(advisory);
             final List<VulnerableSoftware> vsListOld = qm.detach(qm.getVulnerableSoftwareByVulnId(vulnerability.getSource(), vulnerability.getVulnId()));
-            final Vulnerability existingVulnerability = qm.getVulnerabilityByVulnId(vulnerability.getSource(), vulnerability.getVulnId());;
+            final Vulnerability existingVulnerability = qm.getVulnerabilityByVulnId(vulnerability.getSource(), vulnerability.getVulnId());
             final Vulnerability.Source vulnerabilitySource = extractSource(advisory.getId());
             final ConfigPropertyConstants vulnAuthoritativeSourceToggle = switch (vulnerabilitySource) {
                 case NVD -> ConfigPropertyConstants.VULNERABILITY_SOURCE_NVD_ENABLED;
                 case GITHUB -> ConfigPropertyConstants.VULNERABILITY_SOURCE_GITHUB_ADVISORIES_ENABLED;
                 default -> VULNERABILITY_SOURCE_GOOGLE_OSV_ENABLED;
             };
-            final boolean vulnAuthoritativeSourceEnabled = Boolean.valueOf(qm.getConfigProperty(vulnAuthoritativeSourceToggle.getGroupName(), vulnAuthoritativeSourceToggle.getPropertyName()).getPropertyValue());
+            final boolean vulnAuthoritativeSourceEnabled = Boolean.parseBoolean(qm.getConfigProperty(vulnAuthoritativeSourceToggle.getGroupName(), vulnAuthoritativeSourceToggle.getPropertyName()).getPropertyValue());
             Vulnerability synchronizedVulnerability = existingVulnerability;
             if (shouldUpdateExistingVulnerability(existingVulnerability, vulnerabilitySource, vulnAuthoritativeSourceEnabled)) {
-               synchronizedVulnerability  = qm.synchronizeVulnerability(vulnerability, false);
-               if (synchronizedVulnerability == null) return; // Exit if nothing to update
+                synchronizedVulnerability  = qm.synchronizeVulnerability(vulnerability, false);
+                if (synchronizedVulnerability == null) return; // Exit if nothing to update
             }
 
             if (aliasSyncEnabled && advisory.getAliases() != null) {
@@ -231,10 +312,10 @@ public class OsvDownloadTask implements LoggableSubscriber {
     private boolean shouldUpdateExistingVulnerability(Vulnerability existingVulnerability, Vulnerability.Source vulnerabilitySource, boolean vulnAuthoritativeSourceEnabled) {
         return (Vulnerability.Source.OSV == vulnerabilitySource) // Non GHSA nor NVD
                 || (existingVulnerability == null) // Vuln is not replicated yet or declared by authoritative source with appropriate state
-                || (existingVulnerability != null && !vulnAuthoritativeSourceEnabled); // Vuln has been replicated but authoritative source is disabled
+                || !vulnAuthoritativeSourceEnabled; // Vuln has been replicated but authoritative source is disabled
     }
 
-    public Vulnerability mapAdvisoryToVulnerability(final QueryManager qm, final OsvAdvisory advisory) {
+    public Vulnerability mapAdvisoryToVulnerability(final OsvAdvisory advisory) {
 
         final Vulnerability vuln = new Vulnerability();
         if(advisory.getId() != null) {
@@ -250,7 +331,7 @@ public class OsvDownloadTask implements LoggableSubscriber {
             vuln.setCredits(String.join(", ", advisory.getCredits()));
         }
 
-        if (advisory.getReferences() != null && advisory.getReferences().size() > 0) {
+        if (advisory.getReferences() != null && !advisory.getReferences().isEmpty()) {
             final StringBuilder sb = new StringBuilder();
             for (String ref : advisory.getReferences()) {
                 sb.append("* [").append(ref).append("](").append(ref).append(")\n");
