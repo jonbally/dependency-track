@@ -18,6 +18,7 @@
  */
 package org.dependencytrack.tasks;
 
+import alpine.Config;
 import alpine.common.logging.Logger;
 import alpine.event.framework.Event;
 import alpine.event.framework.LoggableSubscriber;
@@ -51,11 +52,7 @@ import org.json.JSONObject;
 import org.json.JSONTokener;
 import org.slf4j.MDC;
 
-import java.io.IOException;
-import java.io.InputStream;
-import java.io.InputStreamReader;
-import java.io.BufferedReader;
-import java.io.BufferedInputStream;
+import java.io.*;
 import java.net.URLEncoder;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
@@ -85,16 +82,24 @@ import static org.dependencytrack.util.VulnerabilityUtil.normalizedCvssV3Score;
 
 public class OsvDownloadTask implements LoggableSubscriber {
 
+    public static final Path DEFAULT_OSV_MIRROR_DIR = Config.getInstance().getDataDirectorty().toPath().resolve("osv").toAbsolutePath();
+    private static final long MAX_ZIP_BYTES = 500L * 1024 * 1024; // Max size for zip files 500 MiB
+
     private static final Logger LOGGER = Logger.getLogger(OsvDownloadTask.class);
     private Set<String> ecosystems;
     private String osvBaseUrl;
+    private File outputDir;
+    private final Path mirrorDirPath;
     private boolean aliasSyncEnabled;
     private long metricParseTime;
     private long metricDownloadTime;
 
-    private static final long MAX_ZIP_BYTES = 500L * 1024 * 1024; // Max size for zip files 500 MiB
-
     public OsvDownloadTask() {
+        this(DEFAULT_OSV_MIRROR_DIR);
+    }
+
+    OsvDownloadTask(final Path mirrorDirPath) {
+        this.mirrorDirPath = mirrorDirPath;
         try (final QueryManager qm = new QueryManager()) {
             final ConfigProperty enabled = qm.getConfigProperty(VULNERABILITY_SOURCE_GOOGLE_OSV_ENABLED.getGroupName(), VULNERABILITY_SOURCE_GOOGLE_OSV_ENABLED.getPropertyName());
             if (enabled != null) {
@@ -125,6 +130,7 @@ public class OsvDownloadTask implements LoggableSubscriber {
                 return;
             }
             final long start = System.currentTimeMillis();
+            setOutputDir(mirrorDirPath.toAbsolutePath().toString());
             ecosystems.forEach(this::processEcosystem);
             final long end = System.currentTimeMillis();
             LOGGER.info("Google OSV mirroring complete");
@@ -140,7 +146,7 @@ public class OsvDownloadTask implements LoggableSubscriber {
                     + "/all.zip";
             LOGGER.info("Initiating download of " + url);
             final long downloadStart = System.currentTimeMillis();
-            Path tempFile = downloadZipDataFile(url, ecosystem);
+            Path tempFile = downloadZipFile(url, ecosystem);
             if (tempFile != null) {
                 LOGGER.debug("Downloaded OSV advisories for " +  ecosystem + " into temp file at " + tempFile);
                 final long downloadEnd = System.currentTimeMillis();
@@ -152,7 +158,7 @@ public class OsvDownloadTask implements LoggableSubscriber {
         }
     }
 
-    private Path downloadZipDataFile(String url, String ecosystem) throws IOException, IllegalStateException {
+    private Path downloadZipFile(String url, String ecosystem) throws IOException, IllegalStateException {
         final HttpUriRequest request = new HttpGet(url);
         try (CloseableHttpResponse response = HttpClientPool.getClient().execute(request)) {
             final StatusLine status = response.getStatusLine();
@@ -172,6 +178,13 @@ public class OsvDownloadTask implements LoggableSubscriber {
                             String.format("ZIP too large for ecosystem %s: %d bytes (limit %d)",
                                     ecosystem, contentLength, MAX_ZIP_BYTES));
                 }
+                // TODO: instead of temp file, download to outputDir, check if file exists, if yes
+                //  then check if timestamp file exists. If yes then parse the timestamp and decide: redownload or get
+                //  only modified_id.csv - do this check in processEcosystem. Create new method for downloading and
+                //  processing of modified_id.csv. This should be done as in EpssParser.parse()
+                //  additionally another timestamp file should be created for: last incremental update with timestamp
+                //  of start of the task, possibly just ecosystem_modified_id.csv.ts. Then only process the csv file
+                //  until a date older than that is found.
                 final Path tempFile = Files.createTempFile("google-osv-download-" + ecosystem + "-", ".zip");
                 try (final InputStream in = response.getEntity().getContent()) {
                     Files.copy(in, tempFile.toAbsolutePath(), StandardCopyOption.REPLACE_EXISTING);
@@ -243,6 +256,15 @@ public class OsvDownloadTask implements LoggableSubscriber {
             LOGGER.error("JSON parsing error for entry: " + entryName, e);
         } catch (RuntimeException e) {
             LOGGER.error("Unexpected error processing entry: " + entryName, e);
+        }
+    }
+
+    private void setOutputDir(final String outputDirPath) {
+        outputDir = new File(outputDirPath);
+        if (!outputDir.exists()) {
+            if (outputDir.mkdirs()) {
+                LOGGER.info("Mirrored data directory created successfully");
+            }
         }
     }
 
