@@ -26,10 +26,12 @@ import alpine.model.ConfigProperty;
 import com.github.packageurl.MalformedPackageURLException;
 import com.github.packageurl.PackageURL;
 import org.apache.http.HttpEntity;
+import org.apache.http.HttpHeaders;
 import org.apache.http.HttpStatus;
 import org.apache.http.StatusLine;
 import org.apache.http.client.methods.CloseableHttpResponse;
 import org.apache.http.client.methods.HttpGet;
+import org.apache.http.client.methods.HttpHead;
 import org.apache.http.client.methods.HttpUriRequest;
 import org.apache.http.util.EntityUtils;
 import org.dependencytrack.common.HttpClientPool;
@@ -131,7 +133,7 @@ public class OsvDownloadTask implements LoggableSubscriber {
             }
             final long start = System.currentTimeMillis();
             setOutputDir(mirrorDirPath.toAbsolutePath().toString());
-            ecosystems.forEach(this::processEcosystem);
+            ecosystems.forEach(this::processOsvEcosystem);
             final long end = System.currentTimeMillis();
             LOGGER.info("Google OSV mirroring complete");
             LOGGER.info("Time spent (d/l):   " + metricDownloadTime + " ms");
@@ -140,25 +142,58 @@ public class OsvDownloadTask implements LoggableSubscriber {
         }
     }
 
-    private void processEcosystem(String ecosystem) {
+    private void processOsvEcosystem(String ecosystem) {
         try (var ignoredMdcOsvEcosystem = MDC.putCloseable("osvEcosystem", ecosystem)) {
-            String url = this.osvBaseUrl + URLEncoder.encode(ecosystem, StandardCharsets.UTF_8).replace("+", "%20")
-                    + "/all.zip";
-            LOGGER.info("Initiating download of " + url);
-            final long downloadStart = System.currentTimeMillis();
-            Path tempFile = downloadZipFile(url, ecosystem);
-            if (tempFile != null) {
-                LOGGER.debug("Downloaded OSV advisories for " +  ecosystem + " into temp file at " + tempFile);
-                final long downloadEnd = System.currentTimeMillis();
-                metricDownloadTime += downloadEnd - downloadStart;
-                processZipTempFile(tempFile);
+            if (shouldDoIncrementalUpdate(ecosystem)) {
+                String url = this.osvBaseUrl + URLEncoder.encode(ecosystem, StandardCharsets.UTF_8).replace("+", "%20")
+                        + "/modified_id.csv";
+                LOGGER.info("Initiating download of " + url);
+                final long downloadStart = System.currentTimeMillis();
+                Path modifiedCsv = downloadModifiedCsvFile(url, ecosystem);
+                if (modifiedCsv != null) {
+                    LOGGER.debug("Downloaded list of modified OSV advisories for " +  ecosystem + " into " + modifiedCsv);
+                    final long downloadEnd = System.currentTimeMillis();
+                    metricDownloadTime += downloadEnd - downloadStart;
+                    processModifiedCsvFile(modifiedCsv);
+                }
+            } else {
+                String url = this.osvBaseUrl + URLEncoder.encode(ecosystem, StandardCharsets.UTF_8).replace("+", "%20")
+                        + "/all.zip";
+                LOGGER.info("Initiating download of " + url);
+                final long downloadStart = System.currentTimeMillis();
+                Path osvZipFile = downloadOsvZipFile(url, ecosystem);
+                if (osvZipFile != null) {
+                    LOGGER.debug("Downloaded OSV advisories for " +  ecosystem + " into " + osvZipFile);
+                    final long downloadEnd = System.currentTimeMillis();
+                    metricDownloadTime += downloadEnd - downloadStart;
+                    processOsvZipFile(osvZipFile);
+                }
             }
         } catch (Exception ex) {
             LOGGER.error("Exception while downloading/unzipping OSV data for " + ecosystem, ex);
         }
     }
 
-    private Path downloadZipFile(String url, String ecosystem) throws IOException, IllegalStateException {
+    private boolean shouldDoIncrementalUpdate(String ecosystem) {
+        // Check if the file to get (for the ecosystem) already exists in the dir
+        // If it exists then check if a corresponding .ts file for this file exists
+        // If it exists then open and parse the timestamp file to retrieve the timestamp
+        // If the timestamp of modification plus the interval (5 days for now) is greater than current timestamp,
+        // then return true, else false
+        return false;
+    }
+
+    private long getContentLength(final String osvUrl) {
+        final HttpUriRequest request = new HttpHead(osvUrl);
+        try (final CloseableHttpResponse response = HttpClientPool.getClient().execute(request)) {
+            return Long.parseLong(response.getFirstHeader(HttpHeaders.CONTENT_LENGTH).getValue());
+        } catch (IOException | NumberFormatException | NullPointerException e) {
+            LOGGER.error("Failed to determine content length");
+        }
+        return 0;
+    }
+
+    private Path downloadModifiedCsvFile(String url, String ecosystem) throws IOException {
         final HttpUriRequest request = new HttpGet(url);
         try (CloseableHttpResponse response = HttpClientPool.getClient().execute(request)) {
             final StatusLine status = response.getStatusLine();
@@ -166,25 +201,12 @@ public class OsvDownloadTask implements LoggableSubscriber {
             try {
                 LOGGER.info("Downloading...");
                 if (status.getStatusCode() != HttpStatus.SC_OK) {
-                    LOGGER.error("Download failed for: " + ecosystem + " - " +
+                    LOGGER.error("Download of modified_id.csv failed for: " + ecosystem + " - " +
                             status.getStatusCode() + " " + status.getReasonPhrase());
                     return null;
                 }
-                long contentLength = entity.getContentLength();
-                LOGGER.debug("HTTP contentLength for " + ecosystem + ": " + contentLength);
-
-                if (contentLength > MAX_ZIP_BYTES) {
-                    throw new IllegalStateException(
-                            String.format("ZIP too large for ecosystem %s: %d bytes (limit %d)",
-                                    ecosystem, contentLength, MAX_ZIP_BYTES));
-                }
-                // TODO: instead of temp file, download to outputDir, check if file exists, if yes
-                //  then check if timestamp file exists. If yes then parse the timestamp and decide: redownload or get
-                //  only modified_id.csv - do this check in processEcosystem. Create new method for downloading and
-                //  processing of modified_id.csv. This should be done as in EpssParser.parse()
-                //  additionally another timestamp file should be created for: last incremental update with timestamp
-                //  of start of the task, possibly just ecosystem_modified_id.csv.ts. Then only process the csv file
-                //  until a date older than that is found.
+                // TODO: change download to outputDir instead of temp file
+                //  also create the timestamp file for the downloaded file
                 final Path tempFile = Files.createTempFile("google-osv-download-" + ecosystem + "-", ".zip");
                 try (final InputStream in = response.getEntity().getContent()) {
                     Files.copy(in, tempFile.toAbsolutePath(), StandardCopyOption.REPLACE_EXISTING);
@@ -196,7 +218,58 @@ public class OsvDownloadTask implements LoggableSubscriber {
         }
     }
 
-    private void processZipTempFile(Path tempFile) throws IOException {
+    private void processModifiedCsvFile(Path tempFile) throws IOException {
+        final long start = System.currentTimeMillis();
+        if (Files.size(tempFile) <= 0) {
+            LOGGER.warn("Modified CSV file is empty, skipping and deleting: " + tempFile.getFileName());
+            Files.delete(tempFile);
+            return;
+        }
+        LOGGER.info("Processing " + tempFile.getFileName());
+        // TODO: change below to processing of CSV file
+        try (final var in = Files.newInputStream(tempFile, StandardOpenOption.DELETE_ON_CLOSE);
+             final var bufferedIn = new BufferedInputStream(in);
+             final var zipInput = new ZipInputStream(bufferedIn)) {
+            LOGGER.info("Parsing OSV advisory JSON files in " + tempFile.getFileName());
+            // Array of modified advisories = parseModifiedCsv and retrieve the json files
+        }
+        final long end = System.currentTimeMillis();
+        metricParseTime += end - start;
+    }
+
+    private Path downloadOsvZipFile(String url, String ecosystem) throws IOException {
+        final HttpUriRequest request = new HttpGet(url);
+        try (CloseableHttpResponse response = HttpClientPool.getClient().execute(request)) {
+            final StatusLine status = response.getStatusLine();
+            final HttpEntity entity = response.getEntity();
+            try {
+                LOGGER.info("Downloading...");
+                if (status.getStatusCode() != HttpStatus.SC_OK) {
+                    LOGGER.error("Download of all.zip failed for: " + ecosystem + " - " +
+                            status.getStatusCode() + " " + status.getReasonPhrase());
+                    return null;
+                }
+                long contentLength = entity.getContentLength();
+                LOGGER.debug("HTTP contentLength for " + ecosystem + ": " + contentLength);
+                if (contentLength > MAX_ZIP_BYTES) {
+                    throw new IOException(
+                            String.format("ZIP too large for ecosystem %s: %d bytes (limit %d)",
+                                    ecosystem, contentLength, MAX_ZIP_BYTES));
+                }
+                // TODO: change download dir and do not download temp file
+                //  also create the timestamp file for the downloaded file
+                final Path tempFile = Files.createTempFile("google-osv-download-" + ecosystem + "-", ".zip");
+                try (final InputStream in = response.getEntity().getContent()) {
+                    Files.copy(in, tempFile.toAbsolutePath(), StandardCopyOption.REPLACE_EXISTING);
+                    return tempFile.toAbsolutePath();
+                }
+            } finally {
+                EntityUtils.consumeQuietly(entity);
+            }
+        }
+    }
+
+    private void processOsvZipFile(Path tempFile) throws IOException {
         final long start = System.currentTimeMillis();
         if (Files.size(tempFile) <= 0) {
             LOGGER.warn("Temporary OSV file is empty, skipping and deleting: " + tempFile.getFileName());
@@ -208,13 +281,13 @@ public class OsvDownloadTask implements LoggableSubscriber {
              final var bufferedIn = new BufferedInputStream(in);
              final var zipInput = new ZipInputStream(bufferedIn)) {
             LOGGER.info("Parsing OSV advisory JSON files in " + tempFile.getFileName());
-            unzipFolder(zipInput);
+            unzipOsvZipFile(zipInput);
         }
         final long end = System.currentTimeMillis();
         metricParseTime += end - start;
     }
 
-    private void unzipFolder(ZipInputStream zipIn) throws IOException {
+    private void unzipOsvZipFile(ZipInputStream zipIn) throws IOException {
         final Pattern jsonPattern = Pattern.compile("\\.json$", Pattern.CASE_INSENSITIVE);
         final OsvAdvisoryParser parser = new OsvAdvisoryParser();
         ZipEntry zipEntry;
@@ -229,14 +302,14 @@ public class OsvDownloadTask implements LoggableSubscriber {
                     LOGGER.warn("Skipped non-JSON entry: " + entryName);
                     continue;
                 }
-                processJsonAdvisory(zipIn, parser, entryName);
+                processOsvAdvisoryJson(zipIn, parser, entryName);
             } finally {
                 zipIn.closeEntry();
             }
         }
     }
 
-    private void processJsonAdvisory(ZipInputStream zipIn, OsvAdvisoryParser parser, String entryName) {
+    private void processOsvAdvisoryJson(ZipInputStream zipIn, OsvAdvisoryParser parser, String entryName) {
         try {
             final BufferedReader reader = new BufferedReader(
                     new InputStreamReader(zipIn, StandardCharsets.UTF_8), 8192
