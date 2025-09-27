@@ -54,13 +54,20 @@ import org.json.JSONObject;
 import org.json.JSONTokener;
 import org.slf4j.MDC;
 
-import java.io.*;
+import java.io.BufferedReader;
+import java.io.InputStream;
+import java.io.InputStreamReader;
+import java.io.IOException;
+import java.io.BufferedInputStream;
+import java.io.File;
 import java.net.URLEncoder;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
 import java.nio.file.StandardOpenOption;
+import java.time.Instant;
+import java.time.format.DateTimeParseException;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
@@ -154,7 +161,7 @@ public class OsvDownloadTask implements LoggableSubscriber {
                     LOGGER.debug("Downloaded list of modified OSV advisories for " +  ecosystem + " into " + modifiedCsv);
                     final long downloadEnd = System.currentTimeMillis();
                     metricDownloadTime += downloadEnd - downloadStart;
-                    processModifiedCsvFile(modifiedCsv);
+                    processModifiedCsvFile(modifiedCsv, ecosystem);
                 }
             } else {
                 String url = this.osvBaseUrl + URLEncoder.encode(ecosystem, StandardCharsets.UTF_8).replace("+", "%20")
@@ -180,7 +187,7 @@ public class OsvDownloadTask implements LoggableSubscriber {
         // If it exists then open and parse the timestamp file to retrieve the timestamp
         // If the timestamp of modification plus the interval (5 days for now) is greater than current timestamp,
         // then return true, else false
-        return false;
+        return true;
     }
 
     private long getContentLength(final String osvUrl) {
@@ -207,7 +214,7 @@ public class OsvDownloadTask implements LoggableSubscriber {
                 }
                 // TODO: change download to outputDir instead of temp file
                 //  also create the timestamp file for the downloaded file
-                final Path tempFile = Files.createTempFile("google-osv-download-" + ecosystem + "-", ".zip");
+                final Path tempFile = Files.createTempFile("google-osv-modified-" + ecosystem + "-", ".csv");
                 try (final InputStream in = response.getEntity().getContent()) {
                     Files.copy(in, tempFile.toAbsolutePath(), StandardCopyOption.REPLACE_EXISTING);
                     return tempFile.toAbsolutePath();
@@ -218,23 +225,97 @@ public class OsvDownloadTask implements LoggableSubscriber {
         }
     }
 
-    private void processModifiedCsvFile(Path tempFile) throws IOException {
+    private void processModifiedCsvFile(Path modifiedCsvFilePath, String ecosystem) throws IOException {
         final long start = System.currentTimeMillis();
-        if (Files.size(tempFile) <= 0) {
-            LOGGER.warn("Modified CSV file is empty, skipping and deleting: " + tempFile.getFileName());
-            Files.delete(tempFile);
+        if (Files.size(modifiedCsvFilePath) <= 0) {
+            LOGGER.warn("Modified CSV file is empty, skipping and deleting: " + modifiedCsvFilePath.getFileName());
+            Files.delete(modifiedCsvFilePath);
             return;
         }
-        LOGGER.info("Processing " + tempFile.getFileName());
-        // TODO: change below to processing of CSV file
-        try (final var in = Files.newInputStream(tempFile, StandardOpenOption.DELETE_ON_CLOSE);
-             final var bufferedIn = new BufferedInputStream(in);
-             final var zipInput = new ZipInputStream(bufferedIn)) {
-            LOGGER.info("Parsing OSV advisory JSON files in " + tempFile.getFileName());
-            // Array of modified advisories = parseModifiedCsv and retrieve the json files
-        }
+        LOGGER.info("Parsing OSV advisory JSON files in " + modifiedCsvFilePath.getFileName());
+        Instant lastUpdate = Instant.parse("2025-09-24T23:41:23.279728Z"); // TODO: remove and replace with actual last update
+        // TODO: Problem - some modified_id.csv files, e.g. Debian, contain a lot of modified entries within a short time
+        //  this could be handled in a few ways, such as limiting incremental updates to 1000 or less advisories or batching
+        ArrayList<JSONObject> modifiedOsvAdvisories = downloadModifiedOsvAdvisories(modifiedCsvFilePath, lastUpdate, ecosystem);
+        assert modifiedOsvAdvisories != null;
+        modifiedOsvAdvisories.forEach(this::processOsvAdvisoryJsonFromCsv);
         final long end = System.currentTimeMillis();
         metricParseTime += end - start;
+    }
+
+    private ArrayList<JSONObject> downloadModifiedOsvAdvisories(Path modifiedCsvFilePath, Instant lastUpdate, String ecosystem) throws IOException {
+        ArrayList<String> modifiedIds = new ArrayList<>();
+        try (BufferedReader reader = Files.newBufferedReader(modifiedCsvFilePath)) {
+            String line;
+            while ((line = reader.readLine()) != null) {
+                line = line.trim();
+                if (line.isEmpty()) {
+                    continue;
+                }
+                String[] parts = line.split(",", 2);
+                if (parts.length != 2) {
+                    continue;
+                }
+                String timestampStr = parts[0].trim();
+                String id = parts[1].trim();
+                try {
+                    Instant currentTimestamp = Instant.parse(timestampStr);
+                    if (lastUpdate != null && currentTimestamp.isBefore(lastUpdate)) {
+                        break;
+                    }
+                    modifiedIds.add(id);
+                    LOGGER.info("ID added: " + id);
+                } catch (DateTimeParseException e) {
+                    System.err.println("Skipping line with invalid timestamp: " + line);
+                }
+            }
+        }
+        ArrayList<JSONObject> modifiedAdvisoriesJson = new ArrayList<>();
+        for (String id : modifiedIds) {
+            String url = this.osvBaseUrl + URLEncoder.encode(ecosystem, StandardCharsets.UTF_8).replace("+", "%20")
+                    + "/" + id + ".json";
+            final HttpUriRequest request = new HttpGet(url);
+            try (CloseableHttpResponse response = HttpClientPool.getClient().execute(request)) {
+                final StatusLine status = response.getStatusLine();
+                final HttpEntity entity = response.getEntity();
+                try {
+                    if (status.getStatusCode() != HttpStatus.SC_OK) {
+                        LOGGER.error("Download of advisory file failed for: " + id + " - " +
+                                status.getStatusCode() + " " + status.getReasonPhrase());
+                        return null;
+                    }
+                    try (final InputStream in = response.getEntity().getContent()) {
+                        final BufferedReader reader = new BufferedReader(
+                                new InputStreamReader(in, StandardCharsets.UTF_8), 8192
+                        );
+                        LOGGER.info("Downloaded: " + url);
+                        final JSONObject json = new JSONObject(new JSONTokener(reader));
+                        modifiedAdvisoriesJson.add(json);
+                    }
+                } finally {
+                    EntityUtils.consumeQuietly(entity);
+                }
+            }
+        }
+        return modifiedAdvisoriesJson;
+    }
+
+    private void processOsvAdvisoryJsonFromCsv(JSONObject modifiedOsvAdvisory) {
+        final OsvAdvisoryParser parser = new OsvAdvisoryParser();
+        try {
+            final String advisoryId = modifiedOsvAdvisory.optString("id", "unknown");
+            try (var ignoredMdcVulnId = MDC.putCloseable(MDC_VULN_ID, advisoryId)) {
+                final OsvAdvisory osvAdvisory = parser.parse(modifiedOsvAdvisory);
+                if (osvAdvisory != null) {
+                    updateDatasource(osvAdvisory);
+                    LOGGER.info("Successfully processed advisory: " + advisoryId);
+                } else {
+                    LOGGER.debug("Advisory: " + advisoryId + " was not processed further (withdrawn or parsing error)");
+                }
+            }
+        } catch (RuntimeException e) {
+            LOGGER.error("Unexpected error processing modified OSV advisory: ", e);
+        }
     }
 
     private Path downloadOsvZipFile(String url, String ecosystem) throws IOException {
@@ -289,7 +370,6 @@ public class OsvDownloadTask implements LoggableSubscriber {
 
     private void unzipOsvZipFile(ZipInputStream zipIn) throws IOException {
         final Pattern jsonPattern = Pattern.compile("\\.json$", Pattern.CASE_INSENSITIVE);
-        final OsvAdvisoryParser parser = new OsvAdvisoryParser();
         ZipEntry zipEntry;
         while ((zipEntry = zipIn.getNextEntry()) != null) {
             try {
@@ -302,14 +382,15 @@ public class OsvDownloadTask implements LoggableSubscriber {
                     LOGGER.warn("Skipped non-JSON entry: " + entryName);
                     continue;
                 }
-                processOsvAdvisoryJson(zipIn, parser, entryName);
+                processOsvAdvisoryJsonFromZip(zipIn, entryName);
             } finally {
                 zipIn.closeEntry();
             }
         }
     }
 
-    private void processOsvAdvisoryJson(ZipInputStream zipIn, OsvAdvisoryParser parser, String entryName) {
+    private void processOsvAdvisoryJsonFromZip(ZipInputStream zipIn, String entryName) {
+        final OsvAdvisoryParser parser = new OsvAdvisoryParser();
         try {
             final BufferedReader reader = new BufferedReader(
                     new InputStreamReader(zipIn, StandardCharsets.UTF_8), 8192
