@@ -54,12 +54,7 @@ import org.json.JSONObject;
 import org.json.JSONTokener;
 import org.slf4j.MDC;
 
-import java.io.BufferedInputStream;
-import java.io.BufferedReader;
-import java.io.File;
-import java.io.InputStream;
-import java.io.InputStreamReader;
-import java.io.IOException;
+import java.io.*;
 import java.net.URLEncoder;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
@@ -68,6 +63,8 @@ import java.nio.file.StandardCopyOption;
 import java.nio.file.StandardOpenOption;
 import java.time.Instant;
 import java.time.format.DateTimeParseException;
+import java.time.temporal.ChronoUnit;
+import java.time.temporal.TemporalUnit;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
@@ -235,7 +232,8 @@ public class OsvDownloadTask implements LoggableSubscriber {
             return;
         }
         LOGGER.info("Parsing OSV advisory JSON files in " + modifiedCsvFilePath.getFileName());
-        Instant lastUpdate = Instant.parse("2025-09-28T06:00:23.279728Z"); // TODO: remove and replace with actual last update time
+        // Instant lastUpdate = Instant.parse("2025-09-24T06:00:23.279728Z"); // TODO: remove and replace with actual last update time
+        Instant lastUpdate = Instant.now().minus(5, ChronoUnit.DAYS);
         // TODO: correct the addition of download and parse times, currently it is not correct
         downloadAndProcessModifiedOsvAdvisories(modifiedCsvFilePath, lastUpdate, ecosystem);
         final long end = System.currentTimeMillis();
@@ -249,6 +247,7 @@ public class OsvDownloadTask implements LoggableSubscriber {
             return;
         }
         int count = 0;
+        final OsvAdvisoryParser parser = new OsvAdvisoryParser();
         for (String id : modifiedIds) {
             String url = this.osvBaseUrl + URLEncoder.encode(ecosystem, StandardCharsets.UTF_8).replace("+", "%20")
                     + "/" + id + ".json";
@@ -267,7 +266,10 @@ public class OsvDownloadTask implements LoggableSubscriber {
                                 new InputStreamReader(in, StandardCharsets.UTF_8), 8192
                         );
                         final JSONObject json = new JSONObject(new JSONTokener(reader));
-                        processOsvAdvisoryJsonFromCsv(json);
+                        processOsvAdvisoryJsonFromCsv(json, parser);
+                        if (count % 500 == 0) {
+                            LOGGER.info("Already processed " + count + " modified advisories");
+                        }
                         count++;
                     }
                 } catch (JSONException e) {
@@ -305,8 +307,10 @@ public class OsvDownloadTask implements LoggableSubscriber {
                     if (lastUpdate != null && currentTimestamp.isBefore(lastUpdate)) {
                         break;
                     }
-                    if (modifiedIds.size() >= 250) {
-                        LOGGER.info("Cutting off at 250 modified advisories");
+                    // For some ecosystem more than 10k advisories might be modified within a day, but those updates are mostly versions being added after a new release
+                    // 10k might even be too much, perhaps limit to 1000
+                    if (modifiedIds.size() >= 1000) {
+                        LOGGER.info("Cutting off at 1000 modified advisories, remaining updates will be retrieved in weekly full mirror");
                         break;
                     }
                     modifiedIds.add(id);
@@ -319,8 +323,7 @@ public class OsvDownloadTask implements LoggableSubscriber {
         return modifiedIds;
     }
 
-    private void processOsvAdvisoryJsonFromCsv(JSONObject modifiedOsvAdvisory) {
-        final OsvAdvisoryParser parser = new OsvAdvisoryParser();
+    private void processOsvAdvisoryJsonFromCsv(JSONObject modifiedOsvAdvisory, OsvAdvisoryParser parser) {
         try {
             final String advisoryId = modifiedOsvAdvisory.optString("id", "unknown");
             try (var ignoredMdcVulnId = MDC.putCloseable(MDC_VULN_ID, advisoryId)) {
@@ -428,6 +431,13 @@ public class OsvDownloadTask implements LoggableSubscriber {
             LOGGER.error("JSON parsing error for entry: " + entryName, e);
         } catch (RuntimeException e) {
             LOGGER.error("Unexpected error processing entry: " + entryName, e);
+        }
+    }
+
+    private void writeTimeStampFile(final File file, Instant modificationTime) throws IOException {
+        if (!file.exists() || file.isDirectory()) return; // TODO: remove if not needed
+        try (FileWriter writer= new FileWriter(file)) {
+            writer.write(modificationTime.toString());
         }
     }
 
