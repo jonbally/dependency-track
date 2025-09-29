@@ -54,12 +54,12 @@ import org.json.JSONObject;
 import org.json.JSONTokener;
 import org.slf4j.MDC;
 
+import java.io.BufferedInputStream;
 import java.io.BufferedReader;
+import java.io.File;
 import java.io.InputStream;
 import java.io.InputStreamReader;
 import java.io.IOException;
-import java.io.BufferedInputStream;
-import java.io.File;
 import java.net.URLEncoder;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
@@ -158,7 +158,7 @@ public class OsvDownloadTask implements LoggableSubscriber {
                 final long downloadStart = System.currentTimeMillis();
                 Path modifiedCsv = downloadModifiedCsvFile(url, ecosystem);
                 if (modifiedCsv != null) {
-                    LOGGER.debug("Downloaded list of modified OSV advisories for " +  ecosystem + " into " + modifiedCsv);
+                    LOGGER.debug("Downloaded list of modified OSV advisories for " + ecosystem + " into " + modifiedCsv);
                     final long downloadEnd = System.currentTimeMillis();
                     metricDownloadTime += downloadEnd - downloadStart;
                     processModifiedCsvFile(modifiedCsv, ecosystem);
@@ -170,7 +170,7 @@ public class OsvDownloadTask implements LoggableSubscriber {
                 final long downloadStart = System.currentTimeMillis();
                 Path osvZipFile = downloadOsvZipFile(url, ecosystem);
                 if (osvZipFile != null) {
-                    LOGGER.debug("Downloaded OSV advisories for " +  ecosystem + " into " + osvZipFile);
+                    LOGGER.debug("Downloaded OSV advisories for " + ecosystem + " into " + osvZipFile);
                     final long downloadEnd = System.currentTimeMillis();
                     metricDownloadTime += downloadEnd - downloadStart;
                     processOsvZipFile(osvZipFile);
@@ -187,9 +187,11 @@ public class OsvDownloadTask implements LoggableSubscriber {
         // If it exists then open and parse the timestamp file to retrieve the timestamp
         // If the timestamp of modification plus the interval (5 days for now) is greater than current timestamp,
         // then return true, else false
+        // TODO: Implement proper checking here, requires .ts files
         return true;
     }
 
+    // TODO: Check if this is needed, else remove
     private long getContentLength(final String osvUrl) {
         final HttpUriRequest request = new HttpHead(osvUrl);
         try (final CloseableHttpResponse response = HttpClientPool.getClient().execute(request)) {
@@ -233,20 +235,60 @@ public class OsvDownloadTask implements LoggableSubscriber {
             return;
         }
         LOGGER.info("Parsing OSV advisory JSON files in " + modifiedCsvFilePath.getFileName());
-        Instant lastUpdate = Instant.parse("2025-09-24T23:41:23.279728Z"); // TODO: remove and replace with actual last update
-        // TODO: Problem - some modified_id.csv files, e.g. Debian, contain a lot of modified entries within a short time
-        //  this could be handled in a few ways, such as limiting incremental updates to 1000 or less advisories or batching
-        ArrayList<JSONObject> modifiedOsvAdvisories = downloadModifiedOsvAdvisories(modifiedCsvFilePath, lastUpdate, ecosystem);
-        assert modifiedOsvAdvisories != null;
-        modifiedOsvAdvisories.forEach(this::processOsvAdvisoryJsonFromCsv);
+        Instant lastUpdate = Instant.parse("2025-09-28T06:00:23.279728Z"); // TODO: remove and replace with actual last update time
+        // TODO: correct the addition of download and parse times, currently it is not correct
+        downloadAndProcessModifiedOsvAdvisories(modifiedCsvFilePath, lastUpdate, ecosystem);
         final long end = System.currentTimeMillis();
         metricParseTime += end - start;
     }
 
-    private ArrayList<JSONObject> downloadModifiedOsvAdvisories(Path modifiedCsvFilePath, Instant lastUpdate, String ecosystem) throws IOException {
+    private void downloadAndProcessModifiedOsvAdvisories(Path modifiedCsvFilePath, Instant lastUpdate, String ecosystem) throws IOException {
+        ArrayList<String> modifiedIds = parseModifiedOsvAdvisoryCsv(modifiedCsvFilePath, lastUpdate);
+        if (modifiedIds.isEmpty()) {
+            LOGGER.info("No updated advisories since last update, skipping");
+            return;
+        }
+        int count = 0;
+        for (String id : modifiedIds) {
+            String url = this.osvBaseUrl + URLEncoder.encode(ecosystem, StandardCharsets.UTF_8).replace("+", "%20")
+                    + "/" + id + ".json";
+            final HttpUriRequest request = new HttpGet(url);
+            try (CloseableHttpResponse response = HttpClientPool.getClient().execute(request)) {
+                final StatusLine status = response.getStatusLine();
+                final HttpEntity entity = response.getEntity();
+                try {
+                    if (status.getStatusCode() != HttpStatus.SC_OK) {
+                        LOGGER.error("Download of advisory file failed for: " + id + " - " +
+                                status.getStatusCode() + " " + status.getReasonPhrase());
+                        continue;
+                    }
+                    try (final InputStream in = response.getEntity().getContent()) {
+                        final BufferedReader reader = new BufferedReader(
+                                new InputStreamReader(in, StandardCharsets.UTF_8), 8192
+                        );
+                        final JSONObject json = new JSONObject(new JSONTokener(reader));
+                        processOsvAdvisoryJsonFromCsv(json);
+                        count++;
+                    }
+                } catch (JSONException e) {
+                    LOGGER.error("Skipping advisory " + id + " due to: ", e);
+                } finally {
+                    EntityUtils.consumeQuietly(entity);
+                }
+            }
+        }
+        LOGGER.info("Downloaded and processed " + count + " advisories");
+    }
+
+    private ArrayList<String> parseModifiedOsvAdvisoryCsv(Path modifiedCsvFilePath, Instant lastUpdate) throws IOException {
         ArrayList<String> modifiedIds = new ArrayList<>();
         try (BufferedReader reader = Files.newBufferedReader(modifiedCsvFilePath)) {
             String line;
+            // for now hard coded limit of 250 modified entries per ecosystem due to some of them containing 10k + ids per day
+            // (mostly these mass changes are adding a version when a new debian version is released)
+            // without this limit the individual JSON file for all of these would be requested, might lead to rate limiting/blocking
+            // those updates which are missed by the incremental update will be fetched in the weekly complete update
+            // TODO: test without this limit, public GCS bucket might not have such strict rate limiting
             while ((line = reader.readLine()) != null) {
                 line = line.trim();
                 if (line.isEmpty()) {
@@ -263,41 +305,18 @@ public class OsvDownloadTask implements LoggableSubscriber {
                     if (lastUpdate != null && currentTimestamp.isBefore(lastUpdate)) {
                         break;
                     }
+                    if (modifiedIds.size() >= 250) {
+                        LOGGER.info("Cutting off at 250 modified advisories");
+                        break;
+                    }
                     modifiedIds.add(id);
-                    LOGGER.info("ID added: " + id);
                 } catch (DateTimeParseException e) {
-                    System.err.println("Skipping line with invalid timestamp: " + line);
+                    LOGGER.error("Skipping CSV line with invalid timestamp: " + line);
                 }
             }
         }
-        ArrayList<JSONObject> modifiedAdvisoriesJson = new ArrayList<>();
-        for (String id : modifiedIds) {
-            String url = this.osvBaseUrl + URLEncoder.encode(ecosystem, StandardCharsets.UTF_8).replace("+", "%20")
-                    + "/" + id + ".json";
-            final HttpUriRequest request = new HttpGet(url);
-            try (CloseableHttpResponse response = HttpClientPool.getClient().execute(request)) {
-                final StatusLine status = response.getStatusLine();
-                final HttpEntity entity = response.getEntity();
-                try {
-                    if (status.getStatusCode() != HttpStatus.SC_OK) {
-                        LOGGER.error("Download of advisory file failed for: " + id + " - " +
-                                status.getStatusCode() + " " + status.getReasonPhrase());
-                        return null;
-                    }
-                    try (final InputStream in = response.getEntity().getContent()) {
-                        final BufferedReader reader = new BufferedReader(
-                                new InputStreamReader(in, StandardCharsets.UTF_8), 8192
-                        );
-                        LOGGER.info("Downloaded: " + url);
-                        final JSONObject json = new JSONObject(new JSONTokener(reader));
-                        modifiedAdvisoriesJson.add(json);
-                    }
-                } finally {
-                    EntityUtils.consumeQuietly(entity);
-                }
-            }
-        }
-        return modifiedAdvisoriesJson;
+        LOGGER.info("Found " + modifiedIds.size() + " advisories that were modified since " + lastUpdate);
+        return modifiedIds;
     }
 
     private void processOsvAdvisoryJsonFromCsv(JSONObject modifiedOsvAdvisory) {
@@ -308,9 +327,8 @@ public class OsvDownloadTask implements LoggableSubscriber {
                 final OsvAdvisory osvAdvisory = parser.parse(modifiedOsvAdvisory);
                 if (osvAdvisory != null) {
                     updateDatasource(osvAdvisory);
-                    LOGGER.info("Successfully processed advisory: " + advisoryId);
                 } else {
-                    LOGGER.debug("Advisory: " + advisoryId + " was not processed further (withdrawn or parsing error)");
+                    LOGGER.debug("Advisory: " + advisoryId + " was not processed further (withdrawn or parsing failed)");
                 }
             }
         } catch (RuntimeException e) {
@@ -439,7 +457,7 @@ public class OsvDownloadTask implements LoggableSubscriber {
             final boolean vulnAuthoritativeSourceEnabled = Boolean.parseBoolean(qm.getConfigProperty(vulnAuthoritativeSourceToggle.getGroupName(), vulnAuthoritativeSourceToggle.getPropertyName()).getPropertyValue());
             Vulnerability synchronizedVulnerability = existingVulnerability;
             if (shouldUpdateExistingVulnerability(existingVulnerability, vulnerabilitySource, vulnAuthoritativeSourceEnabled)) {
-                synchronizedVulnerability  = qm.synchronizeVulnerability(vulnerability, false);
+                synchronizedVulnerability = qm.synchronizeVulnerability(vulnerability, false);
                 if (synchronizedVulnerability == null) return; // Exit if nothing to update
             }
 
@@ -494,7 +512,7 @@ public class OsvDownloadTask implements LoggableSubscriber {
     public Vulnerability mapAdvisoryToVulnerability(final OsvAdvisory advisory) {
 
         final Vulnerability vuln = new Vulnerability();
-        if(advisory.getId() != null) {
+        if (advisory.getId() != null) {
             vuln.setSource(extractSource(advisory.getId()));
         }
         vuln.setVulnId(String.valueOf(advisory.getId()));
@@ -516,7 +534,7 @@ public class OsvDownloadTask implements LoggableSubscriber {
         }
 
         if (advisory.getCweIds() != null) {
-            for (int i=0; i<advisory.getCweIds().size(); i++) {
+            for (int i = 0; i < advisory.getCweIds().size(); i++) {
                 final Cwe cwe = CweResolver.getInstance().lookup(advisory.getCweIds().get(i));
                 if (cwe != null) {
                     vuln.addCwe(cwe);
@@ -533,7 +551,7 @@ public class OsvDownloadTask implements LoggableSubscriber {
     public Severity calculateOSVSeverity(OsvAdvisory advisory) {
 
         // derive from database_specific cvss v3 vector if available
-        if(advisory.getCvssV3Vector() != null) {
+        if (advisory.getCvssV3Vector() != null) {
             var cvss = CvssUtil.parse(advisory.getCvssV3Vector());
             if (cvss != null) {
                 var score = cvss.getBakedScores();
@@ -638,7 +656,7 @@ public class OsvDownloadTask implements LoggableSubscriber {
                      Scanner scanner = new Scanner(in, StandardCharsets.UTF_8)) {
                     while (scanner.hasNextLine()) {
                         final String line = scanner.nextLine();
-                        if(!line.isBlank()) {
+                        if (!line.isBlank()) {
                             ecosystems.add(line.trim());
                         }
                     }
