@@ -100,7 +100,7 @@
         <lib.owasp-rr-calculator.version>1.0.1</lib.owasp-rr-calculator.version>
         <lib.cyclonedx-java.version>11.0.0</lib.cyclonedx-java.version>
         <lib.jakarta-validation.version>3.1.1</lib.jakarta-validation.version>
-        <lib.greenmail.version>2.1.5</lib.greenmail.version>
+        <lib.greenmail.version>2.1.6</lib.greenmail.version>
         <lib.json-java.version>20250517</lib.json-java.version>
         <lib.json-unit.version>4.1.1</lib.json-unit.version>
         <lib.junit.version>5.11.4</lib.junit.version>
@@ -119,7 +119,7 @@
         <lib.woodstox.version>7.1.1</lib.woodstox.version>
         <lib.signpost-core.version>2.1.1</lib.signpost-core.version>
         <lib.httpclient.version>4.5.14</lib.httpclient.version>
-        <lib.httpclient5.version>5.5</lib.httpclient5.version>
+        <lib.httpclient5.version>5.5.1</lib.httpclient5.version>
         <lib.log4j-over-slf4j.version>2.0.17</lib.log4j-over-slf4j.version>
         <lib.org-kohsuke-github-api.version>1.330</lib.org-kohsuke-github-api.version>
         <lib.com-asahaf-javacron.version>1.4.0</lib.com-asahaf-javacron.version>
@@ -679,7 +679,7 @@
             <plugin>
                 <groupId>org.codehaus.mojo</groupId>
                 <artifactId>exec-maven-plugin</artifactId>
-                <version>3.5.1</version>
+                <version>3.6.0</version>
                 <executions>
                     <execution>
                         <id>merge-services-bom</id>
