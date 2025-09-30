@@ -26,12 +26,10 @@ import alpine.model.ConfigProperty;
 import com.github.packageurl.MalformedPackageURLException;
 import com.github.packageurl.PackageURL;
 import org.apache.http.HttpEntity;
-import org.apache.http.HttpHeaders;
 import org.apache.http.HttpStatus;
 import org.apache.http.StatusLine;
 import org.apache.http.client.methods.CloseableHttpResponse;
 import org.apache.http.client.methods.HttpGet;
-import org.apache.http.client.methods.HttpHead;
 import org.apache.http.client.methods.HttpUriRequest;
 import org.apache.http.util.EntityUtils;
 import org.dependencytrack.common.HttpClientPool;
@@ -54,17 +52,21 @@ import org.json.JSONObject;
 import org.json.JSONTokener;
 import org.slf4j.MDC;
 
-import java.io.*;
+import java.io.BufferedInputStream;
+import java.io.BufferedReader;
+import java.io.InputStream;
+import java.io.InputStreamReader;
+import java.io.IOException;
+import java.io.File;
+import java.io.FileWriter;
 import java.net.URLEncoder;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
-import java.nio.file.StandardOpenOption;
 import java.time.Instant;
 import java.time.format.DateTimeParseException;
 import java.time.temporal.ChronoUnit;
-import java.time.temporal.TemporalUnit;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
@@ -90,6 +92,8 @@ public class OsvDownloadTask implements LoggableSubscriber {
 
     public static final Path DEFAULT_OSV_MIRROR_DIR = Config.getInstance().getDataDirectorty().toPath().resolve("osv").toAbsolutePath();
     private static final long MAX_ZIP_BYTES = 500L * 1024 * 1024; // Max size for zip files 500 MiB
+    private static final String MODIFIED_FILENAME_PREFIX = "google-osv-modified-";
+    private static final String FULL_FILENAME_PREFIX = "google-osv-";
 
     private static final Logger LOGGER = Logger.getLogger(OsvDownloadTask.class);
     private Set<String> ecosystems;
@@ -148,10 +152,11 @@ public class OsvDownloadTask implements LoggableSubscriber {
 
     private void processOsvEcosystem(String ecosystem) {
         try (var ignoredMdcOsvEcosystem = MDC.putCloseable("osvEcosystem", ecosystem)) {
+            final Instant current = Instant.now();
             if (shouldDoIncrementalUpdate(ecosystem)) {
                 String url = this.osvBaseUrl + URLEncoder.encode(ecosystem, StandardCharsets.UTF_8).replace("+", "%20")
                         + "/modified_id.csv";
-                LOGGER.info("Initiating download of " + url);
+                LOGGER.info("Incremental update - Initiating download of " + url);
                 final long downloadStart = System.currentTimeMillis();
                 Path modifiedCsv = downloadModifiedCsvFile(url, ecosystem);
                 if (modifiedCsv != null) {
@@ -159,11 +164,13 @@ public class OsvDownloadTask implements LoggableSubscriber {
                     final long downloadEnd = System.currentTimeMillis();
                     metricDownloadTime += downloadEnd - downloadStart;
                     processModifiedCsvFile(modifiedCsv, ecosystem);
+                    File incrementalTimeStampFile = new File(outputDir, MODIFIED_FILENAME_PREFIX + ecosystem + ".csv.ts").getAbsoluteFile();
+                    writeTimeStampFile(incrementalTimeStampFile, current);
                 }
             } else {
                 String url = this.osvBaseUrl + URLEncoder.encode(ecosystem, StandardCharsets.UTF_8).replace("+", "%20")
                         + "/all.zip";
-                LOGGER.info("Initiating download of " + url);
+                LOGGER.info("Full update - Initiating download of " + url);
                 final long downloadStart = System.currentTimeMillis();
                 Path osvZipFile = downloadOsvZipFile(url, ecosystem);
                 if (osvZipFile != null) {
@@ -171,6 +178,12 @@ public class OsvDownloadTask implements LoggableSubscriber {
                     final long downloadEnd = System.currentTimeMillis();
                     metricDownloadTime += downloadEnd - downloadStart;
                     processOsvZipFile(osvZipFile);
+                    File fullTimeStampFile = new File(outputDir, FULL_FILENAME_PREFIX + ecosystem + ".zip.ts").getAbsoluteFile();
+                    writeTimeStampFile(fullTimeStampFile, current);
+                    // Additionally update the incremental update timestamp file as incremental updates only need to happen
+                    // for modifications done after a successful full mirror
+                    File incrementalTimeStampFile = new File(outputDir, FULL_FILENAME_PREFIX + ecosystem + ".zip.ts").getAbsoluteFile();
+                    writeTimeStampFile(incrementalTimeStampFile, current);
                 }
             }
         } catch (Exception ex) {
@@ -179,24 +192,32 @@ public class OsvDownloadTask implements LoggableSubscriber {
     }
 
     private boolean shouldDoIncrementalUpdate(String ecosystem) {
-        // Check if the file to get (for the ecosystem) already exists in the dir
-        // If it exists then check if a corresponding .ts file for this file exists
-        // If it exists then open and parse the timestamp file to retrieve the timestamp
-        // If the timestamp of modification plus the interval (5 days for now) is greater than current timestamp,
-        // then return true, else false
-        // TODO: Implement proper checking here, requires .ts files
-        return true;
-    }
-
-    // TODO: Check if this is needed, else remove
-    private long getContentLength(final String osvUrl) {
-        final HttpUriRequest request = new HttpHead(osvUrl);
-        try (final CloseableHttpResponse response = HttpClientPool.getClient().execute(request)) {
-            return Long.parseLong(response.getFirstHeader(HttpHeaders.CONTENT_LENGTH).getValue());
-        } catch (IOException | NumberFormatException | NullPointerException e) {
-            LOGGER.error("Failed to determine content length");
+        final Instant current = Instant.now();
+        final String fullMirrorOsvFileName = FULL_FILENAME_PREFIX + ecosystem + ".zip";
+        File fullMirrorFile = new File(outputDir, fullMirrorOsvFileName).getAbsoluteFile();
+        if (fullMirrorFile.exists() && fullMirrorFile.length() > 0) {
+            File timestampFile = new File(outputDir, fullMirrorOsvFileName + ".ts");
+            if(timestampFile.exists() && timestampFile.length() > 0) {
+                try (BufferedReader tsBufReader = Files.newBufferedReader(timestampFile.toPath())) {
+                    String text = tsBufReader.readLine();
+                    Instant lastFullMirror = Instant.parse(text);
+                    if (current.isBefore(lastFullMirror.plus(5, ChronoUnit.DAYS))) {
+                        LOGGER.info("Last full mirror was at " + lastFullMirror.truncatedTo(ChronoUnit.SECONDS) + ", performing incremental update for " + ecosystem);
+                        return true;
+                    } else {
+                        LOGGER.info("Last full mirror was at " + lastFullMirror.truncatedTo(ChronoUnit.SECONDS) + ", performing full update for " + ecosystem);
+                        return false;
+                    }
+                } catch (IOException e) {
+                    LOGGER.error("Failed to open .ts file " + timestampFile);
+                    return false;
+                } catch (DateTimeParseException e) {
+                    LOGGER.error("Failed to parse timestamp in .ts file " + timestampFile);
+                    return false;
+                }
+            }
         }
-        return 0;
+        return false;
     }
 
     private Path downloadModifiedCsvFile(String url, String ecosystem) throws IOException {
@@ -211,12 +232,11 @@ public class OsvDownloadTask implements LoggableSubscriber {
                             status.getStatusCode() + " " + status.getReasonPhrase());
                     return null;
                 }
-                // TODO: change download to outputDir instead of temp file
-                //  also create the timestamp file for the downloaded file
-                final Path tempFile = Files.createTempFile("google-osv-modified-" + ecosystem + "-", ".csv");
+                final String fileName = MODIFIED_FILENAME_PREFIX + ecosystem + ".csv";
+                final File file = new File(outputDir, fileName).getAbsoluteFile();
                 try (final InputStream in = response.getEntity().getContent()) {
-                    Files.copy(in, tempFile.toAbsolutePath(), StandardCopyOption.REPLACE_EXISTING);
-                    return tempFile.toAbsolutePath();
+                    Files.copy(in, file.toPath(), StandardCopyOption.REPLACE_EXISTING);
+                    return file.toPath();
                 }
             } finally {
                 EntityUtils.consumeQuietly(entity);
@@ -227,15 +247,21 @@ public class OsvDownloadTask implements LoggableSubscriber {
     private void processModifiedCsvFile(Path modifiedCsvFilePath, String ecosystem) throws IOException {
         final long start = System.currentTimeMillis();
         if (Files.size(modifiedCsvFilePath) <= 0) {
-            LOGGER.warn("Modified CSV file is empty, skipping and deleting: " + modifiedCsvFilePath.getFileName());
-            Files.delete(modifiedCsvFilePath);
+            LOGGER.warn("Modified CSV file is empty, skipping: " + modifiedCsvFilePath.getFileName());
             return;
         }
         LOGGER.info("Parsing OSV advisory JSON files in " + modifiedCsvFilePath.getFileName());
-        // Instant lastUpdate = Instant.parse("2025-09-24T06:00:23.279728Z"); // TODO: remove and replace with actual last update time
-        Instant lastUpdate = Instant.now().minus(5, ChronoUnit.DAYS);
-        // TODO: correct the addition of download and parse times, currently it is not correct
-        downloadAndProcessModifiedOsvAdvisories(modifiedCsvFilePath, lastUpdate, ecosystem);
+        Instant lastUpdate = Instant.EPOCH;
+        final String modifiedOsvTimestampFileName = MODIFIED_FILENAME_PREFIX + ecosystem + ".csv.ts";
+        File modifiedOsvTimestampFile = new File(outputDir, modifiedOsvTimestampFileName).getAbsoluteFile();
+        if(modifiedOsvTimestampFile.exists() && modifiedOsvTimestampFile.length() > 0) {
+            try (BufferedReader tsBufReader = Files.newBufferedReader(modifiedOsvTimestampFile.toPath())) {
+                String text = tsBufReader.readLine();
+                lastUpdate = Instant.parse(text);
+            }
+        }
+        // TODO: correct the addition of download and parse times, currently it is not correctly calculated but for incremental might still be ok
+        downloadAndProcessModifiedOsvAdvisories(modifiedCsvFilePath, lastUpdate.truncatedTo(ChronoUnit.SECONDS), ecosystem);
         final long end = System.currentTimeMillis();
         metricParseTime += end - start;
     }
@@ -267,7 +293,7 @@ public class OsvDownloadTask implements LoggableSubscriber {
                         );
                         final JSONObject json = new JSONObject(new JSONTokener(reader));
                         processOsvAdvisoryJsonFromCsv(json, parser);
-                        if (count % 500 == 0) {
+                        if (count != 0 && count % 500 == 0) {
                             LOGGER.info("Already processed " + count + " modified advisories");
                         }
                         count++;
@@ -286,11 +312,6 @@ public class OsvDownloadTask implements LoggableSubscriber {
         ArrayList<String> modifiedIds = new ArrayList<>();
         try (BufferedReader reader = Files.newBufferedReader(modifiedCsvFilePath)) {
             String line;
-            // for now hard coded limit of 250 modified entries per ecosystem due to some of them containing 10k + ids per day
-            // (mostly these mass changes are adding a version when a new debian version is released)
-            // without this limit the individual JSON file for all of these would be requested, might lead to rate limiting/blocking
-            // those updates which are missed by the incremental update will be fetched in the weekly complete update
-            // TODO: test without this limit, public GCS bucket might not have such strict rate limiting
             while ((line = reader.readLine()) != null) {
                 line = line.trim();
                 if (line.isEmpty()) {
@@ -308,9 +329,10 @@ public class OsvDownloadTask implements LoggableSubscriber {
                         break;
                     }
                     // For some ecosystem more than 10k advisories might be modified within a day, but those updates are mostly versions being added after a new release
-                    // 10k might even be too much, perhaps limit to 1000
-                    if (modifiedIds.size() >= 1000) {
-                        LOGGER.info("Cutting off at 1000 modified advisories, remaining updates will be retrieved in weekly full mirror");
+                    // 10k might even be too much, perhaps limit to 5000
+                    // TODO: test without this limit, public GCS bucket might not have such strict rate limiting
+                    if (modifiedIds.size() >= 5000) {
+                        LOGGER.info("Cutting off at 5000 modified advisories, remaining updates will be retrieved in full mirror every 5 days");
                         break;
                     }
                     modifiedIds.add(id);
@@ -358,12 +380,11 @@ public class OsvDownloadTask implements LoggableSubscriber {
                             String.format("ZIP too large for ecosystem %s: %d bytes (limit %d)",
                                     ecosystem, contentLength, MAX_ZIP_BYTES));
                 }
-                // TODO: change download dir and do not download temp file
-                //  also create the timestamp file for the downloaded file
-                final Path tempFile = Files.createTempFile("google-osv-download-" + ecosystem + "-", ".zip");
+                final String fileName = FULL_FILENAME_PREFIX + ecosystem + ".zip";
+                final File file = new File(outputDir, fileName).getAbsoluteFile();
                 try (final InputStream in = response.getEntity().getContent()) {
-                    Files.copy(in, tempFile.toAbsolutePath(), StandardCopyOption.REPLACE_EXISTING);
-                    return tempFile.toAbsolutePath();
+                    Files.copy(in, file.toPath(), StandardCopyOption.REPLACE_EXISTING);
+                    return file.toPath();
                 }
             } finally {
                 EntityUtils.consumeQuietly(entity);
@@ -371,18 +392,17 @@ public class OsvDownloadTask implements LoggableSubscriber {
         }
     }
 
-    private void processOsvZipFile(Path tempFile) throws IOException {
+    private void processOsvZipFile(Path filePath) throws IOException {
         final long start = System.currentTimeMillis();
-        if (Files.size(tempFile) <= 0) {
-            LOGGER.warn("Temporary OSV file is empty, skipping and deleting: " + tempFile.getFileName());
-            Files.delete(tempFile);
+        if (Files.size(filePath) <= 0) {
+            LOGGER.warn("Downloaded OSV file is empty, skipping: " + filePath.getFileName());
             return;
         }
-        LOGGER.info("Uncompressing " + tempFile.getFileName());
-        try (final var in = Files.newInputStream(tempFile, StandardOpenOption.DELETE_ON_CLOSE);
+        LOGGER.info("Decompressing " + filePath.getFileName());
+        try (final var in = Files.newInputStream(filePath);
              final var bufferedIn = new BufferedInputStream(in);
              final var zipInput = new ZipInputStream(bufferedIn)) {
-            LOGGER.info("Parsing OSV advisory JSON files in " + tempFile.getFileName());
+            LOGGER.info("Parsing OSV advisory JSON files in " + filePath.getFileName());
             unzipOsvZipFile(zipInput);
         }
         final long end = System.currentTimeMillis();
@@ -435,9 +455,8 @@ public class OsvDownloadTask implements LoggableSubscriber {
     }
 
     private void writeTimeStampFile(final File file, Instant modificationTime) throws IOException {
-        if (!file.exists() || file.isDirectory()) return; // TODO: remove if not needed
-        try (FileWriter writer= new FileWriter(file)) {
-            writer.write(modificationTime.toString());
+        try (FileWriter writer = new FileWriter(file)) {
+            writer.write(modificationTime.truncatedTo(ChronoUnit.MILLIS).toString());
         }
     }
 
