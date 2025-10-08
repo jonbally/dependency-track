@@ -85,7 +85,7 @@
         <maven.compiler.target>21</maven.compiler.target>
 
         <!-- Dependency Versions -->
-        <frontend.version>4.13.4</frontend.version>
+        <frontend.version>4.13.5</frontend.version>
         <lib.alpine.version>${project.parent.version}</lib.alpine.version>
         <lib.awaitility.version>4.3.0</lib.awaitility.version>
         <lib.brotli-decoder.version>0.1.2</lib.brotli-decoder.version>
@@ -96,7 +96,7 @@
         <lib.cpe-parser.version>3.0.0</lib.cpe-parser.version>
         <lib.commons-compress.version>1.28.0</lib.commons-compress.version>
         <lib.commons-text.version>1.14.0</lib.commons-text.version>
-        <lib.ae-security.version>0.145.0</lib.ae-security.version>
+        <lib.ae-security.version>0.145.2</lib.ae-security.version>
         <lib.owasp-rr-calculator.version>1.0.1</lib.owasp-rr-calculator.version>
         <lib.cyclonedx-java.version>11.0.0</lib.cyclonedx-java.version>
         <lib.jakarta-validation.version>3.1.1</lib.jakarta-validation.version>
@@ -581,7 +581,7 @@
             <plugin>
                 <groupId>io.github.ascopes</groupId>
                 <artifactId>protobuf-maven-plugin</artifactId>
-                <version>3.10.0</version>
+                <version>3.10.1</version>
                 <configuration>
                     <protocVersion>${lib.protobuf-java.version}</protocVersion>
                     <sourceDirectories>
@@ -679,7 +679,7 @@
             <plugin>
                 <groupId>org.codehaus.mojo</groupId>
                 <artifactId>exec-maven-plugin</artifactId>
-                <version>3.6.0</version>
+                <version>3.6.1</version>
                 <executions>
                     <execution>
                         <id>merge-services-bom</id>
