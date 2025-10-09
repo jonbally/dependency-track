@@ -152,30 +152,29 @@ public class OsvDownloadTask implements LoggableSubscriber {
 
     private void processOsvEcosystem(String ecosystem) {
         try (var ignoredMdcOsvEcosystem = MDC.putCloseable("osvEcosystem", ecosystem)) {
-            final Instant current = Instant.now();
-            if (shouldDoIncrementalUpdate(ecosystem)) {
+            final Instant currentTime = Instant.now();
+            if (shouldDoIncrementalUpdate(ecosystem, currentTime)) {
                 String url = this.osvBaseUrl + URLEncoder.encode(ecosystem, StandardCharsets.UTF_8).replace("+", "%20")
                         + "/modified_id.csv";
                 LOGGER.info("Incremental update mirror - Initiating download of " + url);
-                doUpdate(url, ecosystem, true, current);
+                doUpdate(url, ecosystem, true, currentTime);
             } else {
                 String url = this.osvBaseUrl + URLEncoder.encode(ecosystem, StandardCharsets.UTF_8).replace("+", "%20")
                         + "/all.zip";
                 LOGGER.info("Full mirror - Initiating download of " + url);
-                doUpdate(url, ecosystem, false, current);
+                doUpdate(url, ecosystem, false, currentTime);
             }
         } catch (Exception ex) {
-            LOGGER.error("Exception while downloading/unzipping OSV data for " + ecosystem, ex);
+            LOGGER.error("Exception while downloading/processing OSV data for " + ecosystem, ex);
         }
     }
 
-    private boolean shouldDoIncrementalUpdate(String ecosystem) {
-        final Instant currentTime = Instant.now();
+    private boolean shouldDoIncrementalUpdate(String ecosystem, Instant currentTime) {
         final String fullMirrorOsvFileName = FULL_FILENAME_PREFIX + ecosystem + ".zip";
         final String modifiedOsvFileName = MODIFIED_FILENAME_PREFIX + ecosystem + ".csv";
         File fullMirrorFile = new File(outputDir, fullMirrorOsvFileName).getAbsoluteFile();
 
-        if (!fullMirrorFile.exists() || !(fullMirrorFile.length() > 0)) return false; // Full mirror file not there or is empty
+        if (!fullMirrorFile.exists() || !(fullMirrorFile.length() > 0)) return false;
 
         Instant lastFullMirror = readTimeStampFile(fullMirrorOsvFileName);
         Instant lastIncrementalMirror = readTimeStampFile(modifiedOsvFileName);
@@ -245,8 +244,8 @@ public class OsvDownloadTask implements LoggableSubscriber {
 
     private boolean processModifiedCsvFile(Path modifiedCsvFilePath, String ecosystem) throws IOException {
         final long start = System.currentTimeMillis();
-        if (Files.size(modifiedCsvFilePath) <= 0) {
-            LOGGER.warn("Modified CSV file is empty, skipping: " + modifiedCsvFilePath.getFileName());
+        if (!Files.exists(modifiedCsvFilePath) || Files.isDirectory(modifiedCsvFilePath) || Files.size(modifiedCsvFilePath) == 0) {
+            LOGGER.warn("Downloaded modified OSV .csv file is not processable, skipping: " + modifiedCsvFilePath.getFileName());
             return false;
         }
         LOGGER.info("Parsing OSV advisory JSON files in " + modifiedCsvFilePath.getFileName());
@@ -272,7 +271,7 @@ public class OsvDownloadTask implements LoggableSubscriber {
         for (String id : modifiedIds) {
             final long downloadStartTime = System.currentTimeMillis();
             String url = this.osvBaseUrl + URLEncoder.encode(ecosystem, StandardCharsets.UTF_8).replace("+", "%20")
-                    + "/" + id + ".json";
+                    + "/" + URLEncoder.encode(id, StandardCharsets.UTF_8).replace("+", "%20") + ".json";
             final HttpUriRequest request = new HttpGet(url);
             try (CloseableHttpResponse response = HttpClientPool.getClient().execute(request)) {
                 final StatusLine status = response.getStatusLine();
@@ -352,7 +351,7 @@ public class OsvDownloadTask implements LoggableSubscriber {
                 }
             }
         } catch (RuntimeException e) {
-            LOGGER.error("Unexpected error processing modified OSV advisory: ", e);
+            LOGGER.error("Unexpected error while processing modified OSV advisory: ", e);
         }
     }
 
@@ -389,8 +388,8 @@ public class OsvDownloadTask implements LoggableSubscriber {
 
     private boolean processOsvZipFile(Path filePath) throws IOException {
         final long start = System.currentTimeMillis();
-        if (Files.size(filePath) <= 0) {
-            LOGGER.warn("Downloaded OSV file is empty, skipping: " + filePath.getFileName());
+        if (!Files.exists(filePath) || Files.isDirectory(filePath) || Files.size(filePath) == 0) {
+            LOGGER.warn("Downloaded OSV .zip file is not processable, skipping: " + filePath.getFileName());
             return false;
         }
         LOGGER.info("Decompressing " + filePath.getFileName());
