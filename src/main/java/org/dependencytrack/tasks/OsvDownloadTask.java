@@ -143,6 +143,7 @@ public class OsvDownloadTask implements LoggableSubscriber {
             setOutputDir(mirrorDirPath.toAbsolutePath().toString());
             ecosystems.forEach(this::processOsvEcosystem);
             final long end = System.currentTimeMillis();
+            // TODO: add notification dispatch upon success and also when encountering errors
             LOGGER.info("Google OSV mirroring complete");
             LOGGER.info("Time spent (d/l):   " + metricDownloadTime + " ms");
             LOGGER.info("Time spent (parse): " + metricParseTime + " ms");
@@ -191,15 +192,12 @@ public class OsvDownloadTask implements LoggableSubscriber {
     }
 
     private void doUpdate(String url, String ecosystem, boolean incremental, Instant startTime) throws IOException {
-        final long downloadStart = System.currentTimeMillis();
         File incrementalTimeStampFile = new File(outputDir, MODIFIED_FILENAME_PREFIX + ecosystem + ".csv.ts").getAbsoluteFile();
         File fullTimeStampFile = new File(outputDir, FULL_FILENAME_PREFIX + ecosystem + ".zip.ts").getAbsoluteFile();
         if (incremental) {
             Path modifiedCsv = downloadModifiedCsvFile(url, ecosystem);
             if (modifiedCsv != null) {
                 LOGGER.debug("Downloaded list of modified OSV advisories for " + ecosystem + " into " + modifiedCsv);
-                final long downloadEnd = System.currentTimeMillis();
-                metricDownloadTime += downloadEnd - downloadStart;
                 final boolean success = processModifiedCsvFile(modifiedCsv, ecosystem);
                 if (success) writeTimeStampFile(incrementalTimeStampFile, startTime);
             }
@@ -207,8 +205,6 @@ public class OsvDownloadTask implements LoggableSubscriber {
             Path osvZipFile = downloadOsvZipFile(url, ecosystem);
             if (osvZipFile != null) {
                 LOGGER.debug("Downloaded OSV advisories for " + ecosystem + " into " + osvZipFile);
-                final long downloadEnd = System.currentTimeMillis();
-                metricDownloadTime += downloadEnd - downloadStart;
                 final boolean success = processOsvZipFile(osvZipFile);
                 if (success) {
                     writeTimeStampFile(fullTimeStampFile, startTime);
@@ -219,6 +215,7 @@ public class OsvDownloadTask implements LoggableSubscriber {
     }
 
     private Path downloadModifiedCsvFile(String url, String ecosystem) throws IOException {
+        final long downloadStart = System.currentTimeMillis();
         final HttpUriRequest request = new HttpGet(url);
         try (CloseableHttpResponse response = HttpClientPool.getClient().execute(request)) {
             final StatusLine status = response.getStatusLine();
@@ -234,6 +231,7 @@ public class OsvDownloadTask implements LoggableSubscriber {
                 final File file = new File(outputDir, fileName).getAbsoluteFile();
                 try (final InputStream in = response.getEntity().getContent()) {
                     Files.copy(in, file.toPath(), StandardCopyOption.REPLACE_EXISTING);
+                    metricDownloadTime += System.currentTimeMillis() - downloadStart;
                     return file.toPath();
                 }
             } finally {
@@ -243,14 +241,10 @@ public class OsvDownloadTask implements LoggableSubscriber {
     }
 
     private boolean processModifiedCsvFile(Path modifiedCsvFilePath, String ecosystem) throws IOException {
-        final long start = System.currentTimeMillis();
         if (!Files.exists(modifiedCsvFilePath) || Files.isDirectory(modifiedCsvFilePath) || Files.size(modifiedCsvFilePath) == 0) {
             LOGGER.warn("Downloaded modified OSV .csv file is not processable, skipping: " + modifiedCsvFilePath.getFileName());
             return false;
         }
-        LOGGER.info("Parsing OSV advisory JSON files in " + modifiedCsvFilePath.getFileName());
-        final long end = System.currentTimeMillis();
-        metricParseTime += end - start;
         downloadAndProcessModifiedOsvAdvisories(modifiedCsvFilePath, ecosystem);
         return true;
     }
@@ -304,6 +298,8 @@ public class OsvDownloadTask implements LoggableSubscriber {
 
     private ArrayList<String> parseModifiedOsvAdvisoryCsv(Path modifiedCsvFilePath, Instant lastUpdate) throws IOException {
         ArrayList<String> modifiedIds = new ArrayList<>();
+        final long parseStartTime = System.currentTimeMillis();
+        LOGGER.info("Parsing OSV advisory JSON files in " + modifiedCsvFilePath.getFileName());
         try (BufferedReader reader = Files.newBufferedReader(modifiedCsvFilePath)) {
             String line;
             while ((line = reader.readLine()) != null) {
@@ -322,9 +318,7 @@ public class OsvDownloadTask implements LoggableSubscriber {
                     if (lastUpdate != null && modifiedTimestamp.isBefore(lastUpdate)) {
                         break;
                     }
-                    // For some ecosystems more than 10k advisories might be modified within a day, those updates are usually versions being added after a new release
-                    // 10k might even be too much, perhaps limit to 5000
-                    // TODO: test without this limit, public GCS bucket might not have such strict rate limiting
+                    // For some ecosystems more than 10k advisories might be modified within a day, those updates are usually non-critical i.e. versions being added after a new release
                     if (modifiedIds.size() >= 5000) {
                         LOGGER.warn("Cutting off after 5000 modified advisories, remaining updates will be retrieved in full mirror every 5 days");
                         break;
@@ -336,6 +330,7 @@ public class OsvDownloadTask implements LoggableSubscriber {
             }
         }
         LOGGER.info("Found " + modifiedIds.size() + " advisories that were modified since " + lastUpdate);
+        metricParseTime += System.currentTimeMillis() - parseStartTime;
         return modifiedIds;
     }
 
@@ -356,6 +351,7 @@ public class OsvDownloadTask implements LoggableSubscriber {
     }
 
     private Path downloadOsvZipFile(String url, String ecosystem) throws IOException {
+        final long downloadStart = System.currentTimeMillis();
         final HttpUriRequest request = new HttpGet(url);
         try (CloseableHttpResponse response = HttpClientPool.getClient().execute(request)) {
             final StatusLine status = response.getStatusLine();
@@ -377,7 +373,9 @@ public class OsvDownloadTask implements LoggableSubscriber {
                 final String fileName = FULL_FILENAME_PREFIX + ecosystem + ".zip";
                 final File file = new File(outputDir, fileName).getAbsoluteFile();
                 try (final InputStream in = response.getEntity().getContent()) {
+                    // TODO: might make sense to catch java.net.SocketTimeoutException here and then retry (sometimes randomly occurred while testing)
                     Files.copy(in, file.toPath(), StandardCopyOption.REPLACE_EXISTING);
+                    metricDownloadTime += System.currentTimeMillis() - downloadStart;
                     return file.toPath();
                 }
             } finally {
