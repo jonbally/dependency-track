@@ -23,6 +23,8 @@ import alpine.common.logging.Logger;
 import alpine.event.framework.Event;
 import alpine.event.framework.LoggableSubscriber;
 import alpine.model.ConfigProperty;
+import alpine.notification.Notification;
+import alpine.notification.NotificationLevel;
 import com.github.packageurl.MalformedPackageURLException;
 import com.github.packageurl.PackageURL;
 import org.apache.http.HttpEntity;
@@ -41,6 +43,9 @@ import org.dependencytrack.model.Severity;
 import org.dependencytrack.model.Vulnerability;
 import org.dependencytrack.model.VulnerabilityAlias;
 import org.dependencytrack.model.VulnerableSoftware;
+import org.dependencytrack.notification.NotificationConstants;
+import org.dependencytrack.notification.NotificationGroup;
+import org.dependencytrack.notification.NotificationScope;
 import org.dependencytrack.parser.common.resolver.CweResolver;
 import org.dependencytrack.parser.osv.OsvAdvisoryParser;
 import org.dependencytrack.parser.osv.model.OsvAdvisory;
@@ -90,11 +95,13 @@ import static org.dependencytrack.util.VulnerabilityUtil.normalizedCvssV3Score;
 
 public class OsvDownloadTask implements LoggableSubscriber {
 
-    public static final Path DEFAULT_OSV_MIRROR_DIR = Config.getInstance().getDataDirectorty().toPath().resolve("osv").toAbsolutePath();
-    private static final long MAX_ZIP_BYTES = 500L * 1024 * 1024; // Max size for zip files 500 MiB
-    private static final String MODIFIED_FILENAME_PREFIX = "google-osv-modified-";
-    private static final String FULL_FILENAME_PREFIX = "google-osv-";
-
+    public static final Path DEFAULT_OSV_MIRROR_DIR = Config.getInstance().getDataDirectorty().toPath()
+            .resolve("osv").toAbsolutePath();
+    // Max size for zip files: 750 MiB, some ecosystems might reach this size in a couple of years
+    // (Ubuntu is currently the largest one at ~380 MiB)
+    private static final long MAX_ZIP_BYTES = 750L * 1024 * 1024;
+    // private static final String MODIFIED_FILENAME_PREFIX = "google-osv-modified-";
+    private static final String OSV_FILENAME_PREFIX = "google-osv-";
     private static final Logger LOGGER = Logger.getLogger(OsvDownloadTask.class);
     private Set<String> ecosystems;
     private String osvBaseUrl;
@@ -103,6 +110,7 @@ public class OsvDownloadTask implements LoggableSubscriber {
     private boolean aliasSyncEnabled;
     private long metricParseTime;
     private long metricDownloadTime;
+    private boolean mirroredWithoutErrors = true;
 
     public OsvDownloadTask() {
         this(DEFAULT_OSV_MIRROR_DIR);
@@ -111,13 +119,19 @@ public class OsvDownloadTask implements LoggableSubscriber {
     OsvDownloadTask(final Path mirrorDirPath) {
         this.mirrorDirPath = mirrorDirPath;
         try (final QueryManager qm = new QueryManager()) {
-            final ConfigProperty enabled = qm.getConfigProperty(VULNERABILITY_SOURCE_GOOGLE_OSV_ENABLED.getGroupName(), VULNERABILITY_SOURCE_GOOGLE_OSV_ENABLED.getPropertyName());
+            final ConfigProperty enabled = qm.getConfigProperty(
+                    VULNERABILITY_SOURCE_GOOGLE_OSV_ENABLED.getGroupName(),
+                    VULNERABILITY_SOURCE_GOOGLE_OSV_ENABLED.getPropertyName());
             if (enabled != null) {
                 final String ecosystemConfig = enabled.getPropertyValue();
                 if (ecosystemConfig != null) {
-                    ecosystems = Arrays.stream(ecosystemConfig.split(";")).map(String::trim).collect(Collectors.toSet());
+                    ecosystems = Arrays.stream(ecosystemConfig.split(";"))
+                            .map(String::trim)
+                            .collect(Collectors.toSet());
                 }
-                this.osvBaseUrl = qm.getConfigProperty(VULNERABILITY_SOURCE_GOOGLE_OSV_BASE_URL.getGroupName(), VULNERABILITY_SOURCE_GOOGLE_OSV_BASE_URL.getPropertyName()).getPropertyValue();
+                this.osvBaseUrl = qm.getConfigProperty(
+                        VULNERABILITY_SOURCE_GOOGLE_OSV_BASE_URL.getGroupName(),
+                        VULNERABILITY_SOURCE_GOOGLE_OSV_BASE_URL.getPropertyName()).getPropertyValue();
                 if (this.osvBaseUrl != null && !this.osvBaseUrl.endsWith("/")) {
                     this.osvBaseUrl += "/";
                 }
@@ -143,11 +157,27 @@ public class OsvDownloadTask implements LoggableSubscriber {
             setOutputDir(mirrorDirPath.toAbsolutePath().toString());
             ecosystems.forEach(this::processOsvEcosystem);
             final long end = System.currentTimeMillis();
-            // TODO: add notification dispatch upon success and also when encountering errors
             LOGGER.info("Google OSV mirroring complete");
             LOGGER.info("Time spent (d/l):   " + metricDownloadTime + " ms");
             LOGGER.info("Time spent (parse): " + metricParseTime + " ms");
             LOGGER.info("Time spent (total): " + (end - start) + " ms");
+            if (mirroredWithoutErrors) {
+                Notification.dispatch(new Notification()
+                        .scope(NotificationScope.SYSTEM)
+                        .group(NotificationGroup.DATASOURCE_MIRRORING)
+                        .title(NotificationConstants.Title.OSV_MIRROR)
+                        .content("Mirroring of the Google OSV datastore for the selected ecosystems completed successfully")
+                        .level(NotificationLevel.INFORMATIONAL)
+                );
+            } else {
+                Notification.dispatch(new Notification()
+                        .scope(NotificationScope.SYSTEM)
+                        .group(NotificationGroup.DATASOURCE_MIRRORING)
+                        .title(NotificationConstants.Title.OSV_MIRROR)
+                        .content("An error occurred while mirroring the Google OSV datastore. Check the log for details.")
+                        .level(NotificationLevel.ERROR)
+                );
+            }
         }
     }
 
@@ -155,24 +185,27 @@ public class OsvDownloadTask implements LoggableSubscriber {
         try (var ignoredMdcOsvEcosystem = MDC.putCloseable("osvEcosystem", ecosystem)) {
             final Instant currentTime = Instant.now();
             if (shouldDoIncrementalUpdate(ecosystem, currentTime)) {
-                String url = this.osvBaseUrl + URLEncoder.encode(ecosystem, StandardCharsets.UTF_8).replace("+", "%20")
+                String url = this.osvBaseUrl
+                        + URLEncoder.encode(ecosystem, StandardCharsets.UTF_8).replace("+", "%20")
                         + "/modified_id.csv";
                 LOGGER.info("Incremental update mirror - Initiating download of " + url);
                 doUpdate(url, ecosystem, true, currentTime);
             } else {
-                String url = this.osvBaseUrl + URLEncoder.encode(ecosystem, StandardCharsets.UTF_8).replace("+", "%20")
+                String url = this.osvBaseUrl
+                        + URLEncoder.encode(ecosystem, StandardCharsets.UTF_8).replace("+", "%20")
                         + "/all.zip";
                 LOGGER.info("Full mirror - Initiating download of " + url);
                 doUpdate(url, ecosystem, false, currentTime);
             }
         } catch (Exception ex) {
+            mirroredWithoutErrors = false;
             LOGGER.error("Exception while downloading/processing OSV data for " + ecosystem, ex);
         }
     }
 
     private boolean shouldDoIncrementalUpdate(String ecosystem, Instant currentTime) {
-        final String fullMirrorOsvFileName = FULL_FILENAME_PREFIX + ecosystem + ".zip";
-        final String modifiedOsvFileName = MODIFIED_FILENAME_PREFIX + ecosystem + ".csv";
+        final String fullMirrorOsvFileName = OSV_FILENAME_PREFIX + ecosystem + ".zip";
+        final String modifiedOsvFileName = OSV_FILENAME_PREFIX + ecosystem + "-modified.csv";
         File fullMirrorFile = new File(outputDir, fullMirrorOsvFileName).getAbsoluteFile();
 
         if (!fullMirrorFile.exists() || !(fullMirrorFile.length() > 0)) return false;
@@ -180,26 +213,32 @@ public class OsvDownloadTask implements LoggableSubscriber {
         Instant lastFullMirror = readTimeStampFile(fullMirrorOsvFileName);
         Instant lastIncrementalMirror = readTimeStampFile(modifiedOsvFileName);
         // TODO: check if this could cause issues for edge cases (first full mirror, first incremental etc)
-        if (lastFullMirror == null || lastIncrementalMirror == null) return false; // either timestamp file is not present or is not parseable
+        if (lastFullMirror == null || lastIncrementalMirror == null)
+            return false; // either timestamp file is not present or is not parseable
 
         if (currentTime.isBefore(lastFullMirror.plus(5, ChronoUnit.DAYS))) {
-            LOGGER.info("Last full mirror was at " + lastFullMirror.truncatedTo(ChronoUnit.SECONDS) + ", performing incremental update for " + ecosystem);
+            LOGGER.info("Last successful full mirror was started at " + lastFullMirror.truncatedTo(ChronoUnit.SECONDS)
+                    + ", performing incremental update for " + ecosystem);
             return true;
         } else {
-            LOGGER.info("Last full mirror was at " + lastFullMirror.truncatedTo(ChronoUnit.SECONDS) + ", performing full update for " + ecosystem);
+            LOGGER.info("Last successful full mirror was started at " + lastFullMirror.truncatedTo(ChronoUnit.SECONDS)
+                    + ", performing full update for " + ecosystem);
             return false;
         }
     }
 
     private void doUpdate(String url, String ecosystem, boolean incremental, Instant startTime) throws IOException {
-        File incrementalTimeStampFile = new File(outputDir, MODIFIED_FILENAME_PREFIX + ecosystem + ".csv.ts").getAbsoluteFile();
-        File fullTimeStampFile = new File(outputDir, FULL_FILENAME_PREFIX + ecosystem + ".zip.ts").getAbsoluteFile();
+        File incrementalTimeStampFile = new File(outputDir, OSV_FILENAME_PREFIX + ecosystem + "-modified.csv.ts").getAbsoluteFile();
+        File fullTimeStampFile = new File(outputDir, OSV_FILENAME_PREFIX + ecosystem + ".zip.ts").getAbsoluteFile();
         if (incremental) {
             Path modifiedCsv = downloadModifiedCsvFile(url, ecosystem);
             if (modifiedCsv != null) {
                 LOGGER.debug("Downloaded list of modified OSV advisories for " + ecosystem + " into " + modifiedCsv);
                 final boolean success = processModifiedCsvFile(modifiedCsv, ecosystem);
-                if (success) writeTimeStampFile(incrementalTimeStampFile, startTime);
+                if (success) {
+                    LOGGER.info("Incremental update completed successfully for " + ecosystem);
+                    writeTimeStampFile(incrementalTimeStampFile, startTime);
+                }
             }
         } else {
             Path osvZipFile = downloadOsvZipFile(url, ecosystem);
@@ -207,6 +246,7 @@ public class OsvDownloadTask implements LoggableSubscriber {
                 LOGGER.debug("Downloaded OSV advisories for " + ecosystem + " into " + osvZipFile);
                 final boolean success = processOsvZipFile(osvZipFile);
                 if (success) {
+                    LOGGER.info("Full mirror completed successfully for " + ecosystem);
                     writeTimeStampFile(fullTimeStampFile, startTime);
                     writeTimeStampFile(incrementalTimeStampFile, startTime);
                 }
@@ -225,9 +265,10 @@ public class OsvDownloadTask implements LoggableSubscriber {
                 if (status.getStatusCode() != HttpStatus.SC_OK) {
                     LOGGER.error("Download of modified_id.csv failed for: " + ecosystem + " - " +
                             status.getStatusCode() + " " + status.getReasonPhrase());
+                    mirroredWithoutErrors = false;
                     return null;
                 }
-                final String fileName = MODIFIED_FILENAME_PREFIX + ecosystem + ".csv";
+                final String fileName = OSV_FILENAME_PREFIX + ecosystem + "-modified.csv";
                 final File file = new File(outputDir, fileName).getAbsoluteFile();
                 try (final InputStream in = response.getEntity().getContent()) {
                     Files.copy(in, file.toPath(), StandardCopyOption.REPLACE_EXISTING);
@@ -243,6 +284,7 @@ public class OsvDownloadTask implements LoggableSubscriber {
     private boolean processModifiedCsvFile(Path modifiedCsvFilePath, String ecosystem) throws IOException {
         if (!Files.exists(modifiedCsvFilePath) || Files.isDirectory(modifiedCsvFilePath) || Files.size(modifiedCsvFilePath) == 0) {
             LOGGER.warn("Downloaded modified OSV .csv file is not processable, skipping: " + modifiedCsvFilePath.getFileName());
+            mirroredWithoutErrors = false;
             return false;
         }
         downloadAndProcessModifiedOsvAdvisories(modifiedCsvFilePath, ecosystem);
@@ -258,14 +300,16 @@ public class OsvDownloadTask implements LoggableSubscriber {
         }
         ArrayList<String> modifiedIds = parseModifiedOsvAdvisoryCsv(modifiedCsvFilePath, lastUpdate);
         if (modifiedIds.isEmpty()) {
-            LOGGER.info("No updated advisories since last update, skipping");
+            LOGGER.info("No modified advisories since the last incremental update, skipping");
             return;
         }
         final OsvAdvisoryParser parser = new OsvAdvisoryParser();
         for (String id : modifiedIds) {
             final long downloadStartTime = System.currentTimeMillis();
-            String url = this.osvBaseUrl + URLEncoder.encode(ecosystem, StandardCharsets.UTF_8).replace("+", "%20")
-                    + "/" + URLEncoder.encode(id, StandardCharsets.UTF_8).replace("+", "%20") + ".json";
+            String url = this.osvBaseUrl
+                    + URLEncoder.encode(ecosystem, StandardCharsets.UTF_8).replace("+", "%20")
+                    + "/" + URLEncoder.encode(id, StandardCharsets.UTF_8).replace("+", "%20")
+                    + ".json";
             final HttpUriRequest request = new HttpGet(url);
             try (CloseableHttpResponse response = HttpClientPool.getClient().execute(request)) {
                 final StatusLine status = response.getStatusLine();
@@ -274,6 +318,7 @@ public class OsvDownloadTask implements LoggableSubscriber {
                     if (status.getStatusCode() != HttpStatus.SC_OK) {
                         LOGGER.error("Download of advisory file failed for: " + id + " - " +
                                 status.getStatusCode() + " " + status.getReasonPhrase());
+                        mirroredWithoutErrors = false;
                         continue;
                     }
                     try (final InputStream in = response.getEntity().getContent()) {
@@ -289,6 +334,7 @@ public class OsvDownloadTask implements LoggableSubscriber {
                     }
                 } catch (JSONException e) {
                     LOGGER.error("Skipping advisory " + id + " due to: ", e);
+                    mirroredWithoutErrors = false;
                 } finally {
                     EntityUtils.consumeQuietly(entity);
                 }
@@ -299,7 +345,7 @@ public class OsvDownloadTask implements LoggableSubscriber {
     private ArrayList<String> parseModifiedOsvAdvisoryCsv(Path modifiedCsvFilePath, Instant lastUpdate) throws IOException {
         ArrayList<String> modifiedIds = new ArrayList<>();
         final long parseStartTime = System.currentTimeMillis();
-        LOGGER.info("Parsing OSV advisory JSON files in " + modifiedCsvFilePath.getFileName());
+        LOGGER.info("Parsing " + modifiedCsvFilePath.getFileName() + " to obtain modified OSV advisory IDs");
         try (BufferedReader reader = Files.newBufferedReader(modifiedCsvFilePath)) {
             String line;
             while ((line = reader.readLine()) != null) {
@@ -318,9 +364,11 @@ public class OsvDownloadTask implements LoggableSubscriber {
                     if (lastUpdate != null && modifiedTimestamp.isBefore(lastUpdate)) {
                         break;
                     }
-                    // For some ecosystems more than 10k advisories might be modified within a day, those updates are usually non-critical i.e. versions being added after a new release
+                    // For some ecosystems more than 10k advisories might be modified within a day,
+                    // those updates are usually non-critical i.e. versions being added after a new release
                     if (modifiedIds.size() >= 5000) {
-                        LOGGER.warn("Cutting off after 5000 modified advisories, remaining updates will be retrieved in full mirror every 5 days");
+                        LOGGER.warn("Cutting off after 5000 modified advisories, "
+                                + "remaining updates will be retrieved in full mirror every 5 days");
                         break;
                     }
                     modifiedIds.add(id);
@@ -329,7 +377,9 @@ public class OsvDownloadTask implements LoggableSubscriber {
                 }
             }
         }
-        LOGGER.info("Found " + modifiedIds.size() + " advisories that were modified since " + lastUpdate);
+        if (!modifiedIds.isEmpty()) {
+            LOGGER.info("Found " + modifiedIds.size() + " advisories that were modified since the last incremental update at " + lastUpdate);
+        }
         metricParseTime += System.currentTimeMillis() - parseStartTime;
         return modifiedIds;
     }
@@ -347,6 +397,7 @@ public class OsvDownloadTask implements LoggableSubscriber {
             }
         } catch (RuntimeException e) {
             LOGGER.error("Unexpected error while processing modified OSV advisory: ", e);
+            mirroredWithoutErrors = false;
         }
     }
 
@@ -361,19 +412,22 @@ public class OsvDownloadTask implements LoggableSubscriber {
                 if (status.getStatusCode() != HttpStatus.SC_OK) {
                     LOGGER.error("Download of all.zip failed for: " + ecosystem + " - " +
                             status.getStatusCode() + " " + status.getReasonPhrase());
+                    mirroredWithoutErrors = false;
                     return null;
                 }
                 long contentLength = entity.getContentLength();
                 LOGGER.debug("HTTP contentLength for " + ecosystem + ": " + contentLength);
                 if (contentLength > MAX_ZIP_BYTES) {
-                    throw new IOException(
-                            String.format("ZIP too large for ecosystem %s: %d bytes (limit %d)",
-                                    ecosystem, contentLength, MAX_ZIP_BYTES));
+                    LOGGER.error("zip file for " + ecosystem + " is too large: " + contentLength
+                            + " bytes (limit " + MAX_ZIP_BYTES + ")");
+                    mirroredWithoutErrors = false;
+                    return null;
                 }
-                final String fileName = FULL_FILENAME_PREFIX + ecosystem + ".zip";
+                final String fileName = OSV_FILENAME_PREFIX + ecosystem + ".zip";
                 final File file = new File(outputDir, fileName).getAbsoluteFile();
                 try (final InputStream in = response.getEntity().getContent()) {
-                    // TODO: might make sense to catch java.net.SocketTimeoutException here and then retry (sometimes randomly occurred while testing)
+                    // TODO: might make sense to catch java.net.SocketTimeoutException here and then
+                    //  retry (sometimes randomly occurred while testing)
                     Files.copy(in, file.toPath(), StandardCopyOption.REPLACE_EXISTING);
                     metricDownloadTime += System.currentTimeMillis() - downloadStart;
                     return file.toPath();
@@ -388,6 +442,7 @@ public class OsvDownloadTask implements LoggableSubscriber {
         final long start = System.currentTimeMillis();
         if (!Files.exists(filePath) || Files.isDirectory(filePath) || Files.size(filePath) == 0) {
             LOGGER.warn("Downloaded OSV .zip file is not processable, skipping: " + filePath.getFileName());
+            mirroredWithoutErrors = false;
             return false;
         }
         LOGGER.info("Decompressing " + filePath.getFileName());
@@ -435,15 +490,19 @@ public class OsvDownloadTask implements LoggableSubscriber {
                 final OsvAdvisory osvAdvisory = parser.parse(json);
                 if (osvAdvisory != null) {
                     updateDatasource(osvAdvisory);
-                    LOGGER.debug("Successfully processed advisory: " + advisoryId + " from entry: " + entryName);
+                    LOGGER.debug("Successfully processed advisory: " + advisoryId +
+                            " from entry: " + entryName);
                 } else {
-                    LOGGER.debug("Advisory from entry: " + entryName + " was not processed further (withdrawn or parsing error)");
+                    LOGGER.debug("Advisory from entry: " + entryName +
+                            " was not processed further (withdrawn or parsing error)");
                 }
             }
         } catch (JSONException e) {
             LOGGER.error("JSON parsing error for entry: " + entryName, e);
+            mirroredWithoutErrors = false;
         } catch (RuntimeException e) {
             LOGGER.error("Unexpected error processing entry: " + entryName, e);
+            mirroredWithoutErrors = false;
         }
     }
 
