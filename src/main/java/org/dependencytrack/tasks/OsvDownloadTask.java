@@ -156,10 +156,10 @@ public class OsvDownloadTask implements LoggableSubscriber {
             setOutputDir(mirrorDirPath.toAbsolutePath().toString());
             ecosystems.forEach(this::processOsvEcosystem);
             final long end = System.currentTimeMillis();
-            LOGGER.info("Google OSV mirroring completed");
-            LOGGER.info("Time spent (d/l):   " + metricDownloadTime + " ms");
-            LOGGER.info("Time spent (parse): " + metricParseTime + " ms");
-            LOGGER.info("Time spent (total): " + (end - start) + " ms");
+            LOGGER.info("Google OSV mirroring complete");
+            LOGGER.info("Time spent (d/l):   " + metricDownloadTime + "ms");
+            LOGGER.info("Time spent (parse): " + metricParseTime + "ms");
+            LOGGER.info("Time spent (total): " + (end - start) + "ms");
             if (mirroredWithoutErrors) {
                 Notification.dispatch(new Notification()
                         .scope(NotificationScope.SYSTEM)
@@ -209,11 +209,11 @@ public class OsvDownloadTask implements LoggableSubscriber {
 
         if (!fullMirrorFile.exists() || !(fullMirrorFile.length() > 0)) return false;
 
-        Instant lastFullMirror = readTimeStampFile(fullMirrorOsvFileName);
-        Instant lastIncrementalMirror = readTimeStampFile(modifiedOsvFileName);
+        Instant lastFullMirror = readTimestampFile(fullMirrorOsvFileName);
+        Instant lastIncrementalMirror = readTimestampFile(modifiedOsvFileName);
         // TODO: check if this could cause issues for edge cases (first full mirror, first incremental etc)
         if (lastFullMirror == null || lastIncrementalMirror == null)
-            return false; // either timestamp file is not present or is not parseable
+            return false; // either timestamp file is not present or timestamp parsing failed
 
         if (currentTime.isBefore(lastFullMirror.plus(5, ChronoUnit.DAYS))) {
             LOGGER.info("Last successful full mirror was started at " + lastFullMirror.truncatedTo(ChronoUnit.SECONDS)
@@ -227,8 +227,8 @@ public class OsvDownloadTask implements LoggableSubscriber {
     }
 
     private void doUpdate(String url, String ecosystem, boolean incremental, Instant startTime) throws IOException {
-        File incrementalTimeStampFile = new File(outputDir, OSV_FILENAME_PREFIX + ecosystem + "-modified.csv.ts").getAbsoluteFile();
-        File fullTimeStampFile = new File(outputDir, OSV_FILENAME_PREFIX + ecosystem + ".zip.ts").getAbsoluteFile();
+        File incrementalTimestampFile = new File(outputDir, OSV_FILENAME_PREFIX + ecosystem + "-modified.csv.ts").getAbsoluteFile();
+        File fullTimestampFile = new File(outputDir, OSV_FILENAME_PREFIX + ecosystem + ".zip.ts").getAbsoluteFile();
         if (incremental) {
             Path modifiedCsv = downloadModifiedCsvFile(url, ecosystem);
             if (modifiedCsv != null) {
@@ -236,7 +236,7 @@ public class OsvDownloadTask implements LoggableSubscriber {
                 final boolean success = processModifiedCsvFile(modifiedCsv, ecosystem);
                 if (success) {
                     LOGGER.info("Incremental update completed successfully for " + ecosystem);
-                    writeTimeStampFile(incrementalTimeStampFile, startTime);
+                    writeTimestampFile(incrementalTimestampFile, startTime);
                 }
             }
         } else {
@@ -246,8 +246,8 @@ public class OsvDownloadTask implements LoggableSubscriber {
                 final boolean success = processOsvZipFile(osvZipFile);
                 if (success) {
                     LOGGER.info("Full mirror completed successfully for " + ecosystem);
-                    writeTimeStampFile(fullTimeStampFile, startTime);
-                    writeTimeStampFile(incrementalTimeStampFile, startTime);
+                    writeTimestampFile(fullTimestampFile, startTime);
+                    writeTimestampFile(incrementalTimestampFile, startTime);
                 }
             }
         }
@@ -293,7 +293,7 @@ public class OsvDownloadTask implements LoggableSubscriber {
     }
 
     private void downloadAndProcessModifiedOsvAdvisories(Path modifiedCsvFilePath, String ecosystem) throws IOException {
-        Instant lastUpdate = readTimeStampFile(modifiedCsvFilePath.getFileName().toString());
+        Instant lastUpdate = readTimestampFile(modifiedCsvFilePath.getFileName().toString());
         if (lastUpdate == null) {
             // Should never be reached as the .ts file is already checked in shouldDoIncrementalUpdate()
             LOGGER.error("Could not obtain last update time from timestamp file due to previous error, using fallback timestamp");
@@ -366,8 +366,8 @@ public class OsvDownloadTask implements LoggableSubscriber {
                     if (lastUpdate != null && modifiedTimestamp.isBefore(lastUpdate)) {
                         break;
                     }
-                    // For some ecosystems more than 10k advisories might be modified within a day,
-                    // those updates are usually non-critical i.e. versions being added after a new release
+                    // For some ecosystems more than 10k advisories might sometimes be modified within a day.
+                    // Those mass updates are usually non-critical i.e. versions being added after a new release
                     if (modifiedIds.size() >= 5000) {
                         LOGGER.warn("Cutting off after 5000 modified advisories, "
                                 + "remaining updates will be retrieved in full mirror every 5 days");
@@ -508,7 +508,7 @@ public class OsvDownloadTask implements LoggableSubscriber {
         }
     }
 
-    private Instant readTimeStampFile(final String filename) {
+    private Instant readTimestampFile(final String filename) {
         final String timestampFileName = filename + ".ts";
         File timestampFile = new File(outputDir, timestampFileName).getAbsoluteFile();
         if (!timestampFile.exists() || timestampFile.length() == 0) {
@@ -526,7 +526,7 @@ public class OsvDownloadTask implements LoggableSubscriber {
         }
     }
 
-    private void writeTimeStampFile(final File file, Instant modificationTime) throws IOException {
+    private void writeTimestampFile(final File file, Instant modificationTime) throws IOException {
         try (FileWriter writer = new FileWriter(file)) {
             writer.write(modificationTime.truncatedTo(ChronoUnit.MILLIS).toString());
         }

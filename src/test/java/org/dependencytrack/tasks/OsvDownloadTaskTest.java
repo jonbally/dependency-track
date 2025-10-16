@@ -75,6 +75,9 @@ class OsvDownloadTaskTest extends PersistenceCapableTest {
                 "");
     }
 
+    // TODO: add tests for the reworked download part (incremental updates and full mirror)
+    //  align with NistMirrorTaskTest
+
     @Test
     void testParseOSVJsonToAdvisoryAndSave() throws Exception {
         // Enable alias synchronization
@@ -355,7 +358,7 @@ class OsvDownloadTaskTest extends PersistenceCapableTest {
         OsvAdvisory advisory = parser.parse(jsonObject);
         Assertions.assertNotNull(advisory);
         final var task = new OsvDownloadTask();
-        Vulnerability vuln = task.mapAdvisoryToVulnerability(qm, advisory);
+        Vulnerability vuln = task.mapAdvisoryToVulnerability(advisory);
         Assertions.assertNotNull(vuln);
         Assertions.assertEquals("Skywalker, Solo", vuln.getCredits());
         Assertions.assertEquals("GITHUB", vuln.getSource());
