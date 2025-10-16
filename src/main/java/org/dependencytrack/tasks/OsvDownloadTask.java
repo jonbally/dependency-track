@@ -59,18 +59,18 @@ import org.slf4j.MDC;
 
 import java.io.BufferedInputStream;
 import java.io.BufferedReader;
+import java.io.File;
+import java.io.FileWriter;
 import java.io.InputStream;
 import java.io.InputStreamReader;
 import java.io.IOException;
-import java.io.File;
-import java.io.FileWriter;
 import java.net.URLEncoder;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
-import java.time.Instant;
 import java.time.format.DateTimeParseException;
+import java.time.Instant;
 import java.time.temporal.ChronoUnit;
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -97,10 +97,9 @@ public class OsvDownloadTask implements LoggableSubscriber {
 
     public static final Path DEFAULT_OSV_MIRROR_DIR = Config.getInstance().getDataDirectorty().toPath()
             .resolve("osv").toAbsolutePath();
-    // Max size for zip files: 750 MiB, some ecosystems might reach this size in a couple of years
+    // Max size for ecosystem zip files: 750 MiB, some ecosystems might reach this size in a couple of years
     // (Ubuntu is currently the largest one at ~380 MiB)
     private static final long MAX_ZIP_BYTES = 750L * 1024 * 1024;
-    // private static final String MODIFIED_FILENAME_PREFIX = "google-osv-modified-";
     private static final String OSV_FILENAME_PREFIX = "google-osv-";
     private static final Logger LOGGER = Logger.getLogger(OsvDownloadTask.class);
     private Set<String> ecosystems;
@@ -157,7 +156,7 @@ public class OsvDownloadTask implements LoggableSubscriber {
             setOutputDir(mirrorDirPath.toAbsolutePath().toString());
             ecosystems.forEach(this::processOsvEcosystem);
             final long end = System.currentTimeMillis();
-            LOGGER.info("Google OSV mirroring complete");
+            LOGGER.info("Google OSV mirroring completed");
             LOGGER.info("Time spent (d/l):   " + metricDownloadTime + " ms");
             LOGGER.info("Time spent (parse): " + metricParseTime + " ms");
             LOGGER.info("Time spent (total): " + (end - start) + " ms");
@@ -188,7 +187,7 @@ public class OsvDownloadTask implements LoggableSubscriber {
                 String url = this.osvBaseUrl
                         + URLEncoder.encode(ecosystem, StandardCharsets.UTF_8).replace("+", "%20")
                         + "/modified_id.csv";
-                LOGGER.info("Incremental update mirror - Initiating download of " + url);
+                LOGGER.info("Incremental update - Initiating download of " + url);
                 doUpdate(url, ecosystem, true, currentTime);
             } else {
                 String url = this.osvBaseUrl
@@ -270,6 +269,8 @@ public class OsvDownloadTask implements LoggableSubscriber {
                 }
                 final String fileName = OSV_FILENAME_PREFIX + ecosystem + "-modified.csv";
                 final File file = new File(outputDir, fileName).getAbsoluteFile();
+                // TODO: make this more robust, currently it fails randomly without retry on
+                //  SocketException: Connection reset, SocketTimeoutException: Read timed out
                 try (final InputStream in = response.getEntity().getContent()) {
                     Files.copy(in, file.toPath(), StandardCopyOption.REPLACE_EXISTING);
                     metricDownloadTime += System.currentTimeMillis() - downloadStart;
@@ -303,6 +304,7 @@ public class OsvDownloadTask implements LoggableSubscriber {
             LOGGER.info("No modified advisories since the last incremental update, skipping");
             return;
         }
+        LOGGER.info("Downloading and processing modified advisories");
         final OsvAdvisoryParser parser = new OsvAdvisoryParser();
         for (String id : modifiedIds) {
             final long downloadStartTime = System.currentTimeMillis();
