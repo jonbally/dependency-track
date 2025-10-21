@@ -27,12 +27,17 @@ import alpine.notification.Notification;
 import alpine.notification.NotificationLevel;
 import com.github.packageurl.MalformedPackageURLException;
 import com.github.packageurl.PackageURL;
+import io.github.resilience4j.core.functions.CheckedSupplier;
+import io.github.resilience4j.retry.Retry;
+import io.github.resilience4j.retry.RetryConfig;
+import io.github.resilience4j.retry.RetryRegistry;
 import org.apache.http.HttpEntity;
 import org.apache.http.HttpStatus;
 import org.apache.http.StatusLine;
 import org.apache.http.client.methods.CloseableHttpResponse;
 import org.apache.http.client.methods.HttpGet;
 import org.apache.http.client.methods.HttpUriRequest;
+import org.apache.http.conn.ConnectTimeoutException;
 import org.apache.http.util.EntityUtils;
 import org.dependencytrack.common.HttpClientPool;
 import org.dependencytrack.event.IndexEvent;
@@ -64,11 +69,15 @@ import java.io.FileWriter;
 import java.io.InputStream;
 import java.io.InputStreamReader;
 import java.io.IOException;
+import java.net.NoRouteToHostException;
+import java.net.SocketException;
+import java.net.SocketTimeoutException;
 import java.net.URLEncoder;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
+import java.time.Duration;
 import java.time.format.DateTimeParseException;
 import java.time.Instant;
 import java.time.temporal.ChronoUnit;
@@ -196,7 +205,7 @@ public class OsvDownloadTask implements LoggableSubscriber {
                 LOGGER.info("Full mirror - Initiating download of " + url);
                 doUpdate(url, ecosystem, false, currentTime);
             }
-        } catch (Exception ex) {
+        } catch (Throwable ex) {
             mirroredWithoutErrors = false;
             LOGGER.error("Exception while downloading/processing OSV data for " + ecosystem, ex);
         }
@@ -215,7 +224,7 @@ public class OsvDownloadTask implements LoggableSubscriber {
         if (lastFullMirror == null || lastIncrementalMirror == null)
             return false; // either timestamp file is not present or timestamp parsing failed
 
-        if (currentTime.isBefore(lastFullMirror.plus(5, ChronoUnit.DAYS))) {
+        if (currentTime.isBefore(lastFullMirror.plus(5, ChronoUnit.DAYS))) { // full mirror every five days in case any individual advisory files failed to be retrieved
             LOGGER.info("Last successful full mirror was started at " + lastFullMirror.truncatedTo(ChronoUnit.SECONDS)
                     + ", performing incremental update for " + ecosystem);
             return true;
@@ -226,31 +235,56 @@ public class OsvDownloadTask implements LoggableSubscriber {
         }
     }
 
-    private void doUpdate(String url, String ecosystem, boolean incremental, Instant startTime) throws IOException {
+    private void doUpdate(String url, String ecosystem, boolean incremental, Instant startTime) throws Throwable {
         File incrementalTimestampFile = new File(outputDir, OSV_FILENAME_PREFIX + ecosystem + "-modified.csv.ts").getAbsoluteFile();
         File fullTimestampFile = new File(outputDir, OSV_FILENAME_PREFIX + ecosystem + ".zip.ts").getAbsoluteFile();
         if (incremental) {
-            Path modifiedCsv = downloadModifiedCsvFile(url, ecosystem);
-            if (modifiedCsv != null) {
-                LOGGER.debug("Downloaded list of modified OSV advisories for " + ecosystem + " into " + modifiedCsv);
-                final boolean success = processModifiedCsvFile(modifiedCsv, ecosystem);
-                if (success) {
-                    LOGGER.info("Incremental update completed successfully for " + ecosystem);
-                    writeTimestampFile(incrementalTimestampFile, startTime);
-                }
+            Path modifiedCsv = downloadWithRetry(() -> downloadModifiedCsvFile(url, ecosystem));
+            LOGGER.debug("Downloaded list of modified OSV advisories for " + ecosystem + " into " + modifiedCsv);
+            final boolean success = processModifiedCsvFile(modifiedCsv, ecosystem);
+            if (success) {
+                LOGGER.info("Incremental update completed successfully for " + ecosystem);
+                writeTimestampFile(incrementalTimestampFile, startTime);
             }
         } else {
-            Path osvZipFile = downloadOsvZipFile(url, ecosystem);
-            if (osvZipFile != null) {
-                LOGGER.debug("Downloaded OSV advisories for " + ecosystem + " into " + osvZipFile);
-                final boolean success = processOsvZipFile(osvZipFile);
-                if (success) {
-                    LOGGER.info("Full mirror completed successfully for " + ecosystem);
-                    writeTimestampFile(fullTimestampFile, startTime);
-                    writeTimestampFile(incrementalTimestampFile, startTime);
-                }
+            Path osvZipFile = downloadWithRetry(() -> downloadOsvZipFile(url, ecosystem));
+            LOGGER.debug("Downloaded OSV advisories for " + ecosystem + " into " + osvZipFile);
+            final boolean success = processOsvZipFile(osvZipFile);
+            if (success) {
+                LOGGER.info("Full mirror completed successfully for " + ecosystem);
+                writeTimestampFile(fullTimestampFile, startTime);
+                writeTimestampFile(incrementalTimestampFile, startTime);
             }
         }
+    }
+
+    // TODO: align with NistMirrorTask retry config
+    private static final Retry FILE_DOWNLOAD_RETRY = createRetryConfig();
+    private static Retry createRetryConfig() {
+        RetryConfig config = RetryConfig.custom()
+                .maxAttempts(3)
+                .waitDuration(Duration.ofSeconds(2))
+                .retryExceptions(
+                        SocketException.class, SocketTimeoutException.class, IOException.class,
+                        NoRouteToHostException.class, ConnectTimeoutException.class
+                )
+                .ignoreExceptions(IllegalArgumentException.class)
+                .failAfterMaxAttempts(true)
+                .build();
+
+        RetryRegistry registry = RetryRegistry.of(config);
+        Retry retry = registry.retry("fileDownloadRetry");
+
+        retry.getEventPublisher()
+                .onRetry(event -> LOGGER.warn("Retry attempt " + event.getNumberOfRetryAttempts() + " due to: " + event.getLastThrowable()))
+                .onSuccess(event -> LOGGER.debug("Download succeeded after " + event.getNumberOfRetryAttempts() + " attempts"))
+                .onError(event -> LOGGER.error("Download failed after " + event.getNumberOfRetryAttempts() + " attempts"));
+
+        return retry;
+    }
+
+    private <T> T downloadWithRetry(CheckedSupplier<T> downloadOperation) throws Throwable {
+        return FILE_DOWNLOAD_RETRY.executeCheckedSupplier(downloadOperation);
     }
 
     private Path downloadModifiedCsvFile(String url, String ecosystem) throws IOException {
@@ -269,8 +303,6 @@ public class OsvDownloadTask implements LoggableSubscriber {
                 }
                 final String fileName = OSV_FILENAME_PREFIX + ecosystem + "-modified.csv";
                 final File file = new File(outputDir, fileName).getAbsoluteFile();
-                // TODO: make this more robust, currently it fails randomly without retry on
-                //  SocketException: Connection reset, SocketTimeoutException: Read timed out
                 try (final InputStream in = response.getEntity().getContent()) {
                     Files.copy(in, file.toPath(), StandardCopyOption.REPLACE_EXISTING);
                     metricDownloadTime += System.currentTimeMillis() - downloadStart;
