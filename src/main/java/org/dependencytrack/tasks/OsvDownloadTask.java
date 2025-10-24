@@ -27,7 +27,6 @@ import alpine.notification.Notification;
 import alpine.notification.NotificationLevel;
 import com.github.packageurl.MalformedPackageURLException;
 import com.github.packageurl.PackageURL;
-import io.github.resilience4j.core.functions.CheckedSupplier;
 import io.github.resilience4j.retry.Retry;
 import io.github.resilience4j.retry.RetryConfig;
 import io.github.resilience4j.retry.RetryRegistry;
@@ -91,9 +90,11 @@ import java.util.Scanner;
 import java.util.Set;
 import java.util.regex.Pattern;
 import java.util.stream.Collectors;
+import java.util.StringJoiner;
 import java.util.zip.ZipEntry;
 import java.util.zip.ZipInputStream;
 
+import static io.github.resilience4j.core.IntervalFunction.ofExponentialBackoff;
 import static org.dependencytrack.common.MdcKeys.MDC_VULN_ID;
 import static org.dependencytrack.model.ConfigPropertyConstants.VULNERABILITY_SOURCE_GOOGLE_OSV_ALIAS_SYNC_ENABLED;
 import static org.dependencytrack.model.ConfigPropertyConstants.VULNERABILITY_SOURCE_GOOGLE_OSV_BASE_URL;
@@ -239,7 +240,7 @@ public class OsvDownloadTask implements LoggableSubscriber {
         File incrementalTimestampFile = new File(outputDir, OSV_FILENAME_PREFIX + ecosystem + "-modified.csv.ts").getAbsoluteFile();
         File fullTimestampFile = new File(outputDir, OSV_FILENAME_PREFIX + ecosystem + ".zip.ts").getAbsoluteFile();
         if (incremental) {
-            Path modifiedCsv = downloadWithRetry(() -> downloadModifiedCsvFile(url, ecosystem));
+            Path modifiedCsv = RETRY.executeCheckedSupplier(() -> downloadModifiedCsvFile(url, ecosystem));
             LOGGER.debug("Downloaded list of modified OSV advisories for " + ecosystem + " into " + modifiedCsv);
             final boolean success = processModifiedCsvFile(modifiedCsv, ecosystem);
             if (success) {
@@ -247,7 +248,7 @@ public class OsvDownloadTask implements LoggableSubscriber {
                 writeTimestampFile(incrementalTimestampFile, startTime);
             }
         } else {
-            Path osvZipFile = downloadWithRetry(() -> downloadOsvZipFile(url, ecosystem));
+            Path osvZipFile = RETRY.executeCheckedSupplier(() -> downloadOsvZipFile(url, ecosystem));
             LOGGER.debug("Downloaded OSV advisories for " + ecosystem + " into " + osvZipFile);
             final boolean success = processOsvZipFile(osvZipFile);
             if (success) {
@@ -259,13 +260,19 @@ public class OsvDownloadTask implements LoggableSubscriber {
     }
 
     // TODO: align with NistMirrorTask retry config
-    private static final Retry FILE_DOWNLOAD_RETRY = createRetryConfig();
+    private static final Retry RETRY = createRetryConfig();
+
     private static Retry createRetryConfig() {
         RetryConfig config = RetryConfig.custom()
-                .maxAttempts(3)
-                .waitDuration(Duration.ofSeconds(2))
+                .intervalFunction(ofExponentialBackoff(
+                        Duration.ofSeconds(1),
+                        2,
+                        Duration.ofSeconds(32)
+                ))
+                .failAfterMaxAttempts(true)
+                .maxAttempts(6)
                 .retryExceptions(
-                        SocketException.class, SocketTimeoutException.class, IOException.class,
+                        SocketException.class, SocketTimeoutException.class,
                         NoRouteToHostException.class, ConnectTimeoutException.class
                 )
                 .ignoreExceptions(IllegalArgumentException.class)
@@ -273,18 +280,14 @@ public class OsvDownloadTask implements LoggableSubscriber {
                 .build();
 
         RetryRegistry registry = RetryRegistry.of(config);
-        Retry retry = registry.retry("fileDownloadRetry");
+        Retry retry = registry.retry("osv-mirror");
 
         retry.getEventPublisher()
-                .onRetry(event -> LOGGER.warn("Retry attempt " + event.getNumberOfRetryAttempts() + " due to: " + event.getLastThrowable()))
-                .onSuccess(event -> LOGGER.debug("Download succeeded after " + event.getNumberOfRetryAttempts() + " attempts"))
-                .onError(event -> LOGGER.error("Download failed after " + event.getNumberOfRetryAttempts() + " attempts"));
+                .onRetry(event -> LOGGER.warn("Encountered retryable exception; Will execute retry " + event.getNumberOfRetryAttempts() + " due to: " + event.getLastThrowable()))
+                .onSuccess(event -> LOGGER.debug("Succeeded after " + event.getNumberOfRetryAttempts() + " attempts"))
+                .onError(event -> LOGGER.error("Failed after " + event.getNumberOfRetryAttempts() + " attempts"));
 
         return retry;
-    }
-
-    private <T> T downloadWithRetry(CheckedSupplier<T> downloadOperation) throws Throwable {
-        return FILE_DOWNLOAD_RETRY.executeCheckedSupplier(downloadOperation);
     }
 
     private Path downloadModifiedCsvFile(String url, String ecosystem) throws IOException {
@@ -299,7 +302,8 @@ public class OsvDownloadTask implements LoggableSubscriber {
                     LOGGER.error("Download of modified_id.csv failed for: " + ecosystem + " - " +
                             status.getStatusCode() + " " + status.getReasonPhrase());
                     mirroredWithoutErrors = false;
-                    return null;
+                    // TODO: handle certain results/status codes in the retry, so they are not skipped here
+                    throw new IOException("Download failed: " + status);
                 }
                 final String fileName = OSV_FILENAME_PREFIX + ecosystem + "-modified.csv";
                 final File file = new File(outputDir, fileName).getAbsoluteFile();
@@ -345,10 +349,11 @@ public class OsvDownloadTask implements LoggableSubscriber {
                     + "/" + URLEncoder.encode(id, StandardCharsets.UTF_8).replace("+", "%20")
                     + ".json";
             final HttpUriRequest request = new HttpGet(url);
-            try (CloseableHttpResponse response = HttpClientPool.getClient().execute(request)) {
+            try (CloseableHttpResponse response = RETRY.executeCheckedSupplier(() -> HttpClientPool.getClient().execute(request))) {
                 final StatusLine status = response.getStatusLine();
                 final HttpEntity entity = response.getEntity();
                 try {
+                    // TODO: handle certain results/status codes in the retry, so they are not skipped here
                     if (status.getStatusCode() != HttpStatus.SC_OK) {
                         LOGGER.error("Download of advisory file failed for: " + id + " - " +
                                 status.getStatusCode() + " " + status.getReasonPhrase());
@@ -367,11 +372,13 @@ public class OsvDownloadTask implements LoggableSubscriber {
                         metricParseTime += parseEndtime - downloadEndTime;
                     }
                 } catch (JSONException e) {
-                    LOGGER.error("Skipping advisory " + id + " due to: ", e);
-                    mirroredWithoutErrors = false;
+                    LOGGER.warn("Skipping advisory " + id + " due to: ", e);
                 } finally {
                     EntityUtils.consumeQuietly(entity);
                 }
+            } catch (Throwable e) {
+                LOGGER.error("Download or processing failed with an unexpected error: ", e);
+                mirroredWithoutErrors = false;
             }
         }
     }
@@ -400,8 +407,8 @@ public class OsvDownloadTask implements LoggableSubscriber {
                     }
                     // For some ecosystems more than 10k advisories might sometimes be modified within a day.
                     // Those mass updates are usually non-critical i.e. versions being added after a new release
-                    if (modifiedIds.size() >= 5000) {
-                        LOGGER.warn("Cutting off after 5000 modified advisories, "
+                    if (modifiedIds.size() >= 10000) {
+                        LOGGER.warn("Cutting off after 10000 modified advisories, "
                                 + "remaining updates will be retrieved in full mirror every 5 days");
                         break;
                     }
@@ -447,7 +454,8 @@ public class OsvDownloadTask implements LoggableSubscriber {
                     LOGGER.error("Download of all.zip failed for: " + ecosystem + " - " +
                             status.getStatusCode() + " " + status.getReasonPhrase());
                     mirroredWithoutErrors = false;
-                    return null;
+                    // TODO: handle certain results/status codes in the retry, so they are not skipped here
+                    throw new IOException("Download failed: " + status);
                 }
                 long contentLength = entity.getContentLength();
                 LOGGER.debug("HTTP contentLength for " + ecosystem + ": " + contentLength);
@@ -455,13 +463,11 @@ public class OsvDownloadTask implements LoggableSubscriber {
                     LOGGER.error("zip file for " + ecosystem + " is too large: " + contentLength
                             + " bytes (limit " + MAX_ZIP_BYTES + ")");
                     mirroredWithoutErrors = false;
-                    return null;
+                    throw new IOException("Download failed, zip file too large: " + entity.getContentLength());
                 }
                 final String fileName = OSV_FILENAME_PREFIX + ecosystem + ".zip";
                 final File file = new File(outputDir, fileName).getAbsoluteFile();
                 try (final InputStream in = response.getEntity().getContent()) {
-                    // TODO: might make sense to catch java.net.SocketTimeoutException here and then
-                    //  retry (sometimes randomly occurred while testing)
                     Files.copy(in, file.toPath(), StandardCopyOption.REPLACE_EXISTING);
                     metricDownloadTime += System.currentTimeMillis() - downloadStart;
                     return file.toPath();
@@ -660,10 +666,13 @@ public class OsvDownloadTask implements LoggableSubscriber {
 
         if (advisory.getReferences() != null && !advisory.getReferences().isEmpty()) {
             final StringBuilder sb = new StringBuilder();
+            final StringJoiner sj = new StringJoiner("\n");
             for (String ref : advisory.getReferences()) {
-                sb.append("* [").append(ref).append("](").append(ref).append(")\n");
+                sb.append("* [").append(ref).append("](").append(ref).append(")");
+                sj.add(sb.toString());
+                sb.setLength(0);
             }
-            vuln.setReferences(sb.toString());
+            vuln.setReferences(sj.toString());
         }
 
         if (advisory.getCweIds() != null) {
