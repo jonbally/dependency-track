@@ -90,7 +90,7 @@
         <lib.awaitility.version>4.3.0</lib.awaitility.version>
         <lib.brotli-decoder.version>0.1.2</lib.brotli-decoder.version>
         <lib.checkstyle.version>12.1.0</lib.checkstyle.version>
-        <lib.cloud-sql-connector-jdbc-sqlserver.version>1.25.3</lib.cloud-sql-connector-jdbc-sqlserver.version>
+        <lib.cloud-sql-connector-jdbc-sqlserver.version>1.26.1</lib.cloud-sql-connector-jdbc-sqlserver.version>
         <lib.cloud-sql-mysql-socket-factory-connector-j-8.version>1.26.1</lib.cloud-sql-mysql-socket-factory-connector-j-8.version>
         <lib.cloud-sql-postgres-socket-factory.version>1.26.1</lib.cloud-sql-postgres-socket-factory.version>
         <lib.cpe-parser.version>3.0.0</lib.cpe-parser.version>
@@ -129,7 +129,7 @@
         <lib.jdbc-driver.postgresql.version>42.7.8</lib.jdbc-driver.postgresql.version>
         <!-- Maven Plugin Properties -->
         <plugin.retirejs.breakOnFailure>false</plugin.retirejs.breakOnFailure>
-        <plugin.jetty.version>12.1.2</plugin.jetty.version>
+        <plugin.jetty.version>12.1.3</plugin.jetty.version>
         <plugin.protoc-jar.version>3.11.4</plugin.protoc-jar.version>
         <!-- SonarCloud properties -->
         <sonar.exclusions>src/main/webapp/**</sonar.exclusions>
@@ -679,7 +679,7 @@
             <plugin>
                 <groupId>org.codehaus.mojo</groupId>
                 <artifactId>exec-maven-plugin</artifactId>
-                <version>3.6.1</version>
+                <version>3.6.2</version>
                 <executions>
                     <execution>
                         <id>merge-services-bom</id>
@@ -704,7 +704,7 @@
             </plugin>
             <plugin>
                 <artifactId>maven-antrun-plugin</artifactId>
-                <version>3.1.0</version>
+                <version>3.2.0</version>
                 <executions>
                     <execution>
                         <id>deploy-bom</id>
@@ -833,7 +833,7 @@
                 <plugins>
                     <plugin>
                         <artifactId>maven-antrun-plugin</artifactId>
-                        <version>3.1.0</version>
+                        <version>3.2.0</version>
                         <executions>
                             <execution>
                                 <id>frontend-download</id>
