@@ -98,9 +98,6 @@ class OsvDownloadTaskTest extends PersistenceCapableTest {
                 "/unit/osv.jsons/osv-GHSA-77rv-6vfw-x4gc.json"
         });
 
-        stubFor(get(anyUrl())
-                .willReturn(aResponse()
-                        .withStatus(404)));
         stubFor(get(urlPathEqualTo("/Maven/all.zip"))
                 .willReturn(aResponse()
                         .withBody(zippedOsvFileBytes)));
