@@ -217,15 +217,16 @@ class OsvDownloadTaskTest extends PersistenceCapableTest {
         mirrorDirPath.toFile().deleteOnExit();
 
         // Create mock .zip file and .ts files to trigger an incremental update
-        Path tempMockZipFile = mirrorDirPath.resolve("google-osv-Maven.zip");
+        final Path tempMockZipFile = mirrorDirPath.resolve("google-osv-Maven.zip");
         Files.writeString(tempMockZipFile, "------fake-zip-data------");
-        Path tempMockZipTsFile = mirrorDirPath.resolve("google-osv-Maven.zip.ts");
+        final Path tempMockZipTsFile = mirrorDirPath.resolve("google-osv-Maven.zip.ts");
         Files.writeString(tempMockZipTsFile, "2025-10-22T17:35:28Z");
-        Path tempMockCsvTsFile = mirrorDirPath.resolve("google-osv-Maven-modified.csv.ts");
+        final Path tempMockCsvTsFile = mirrorDirPath.resolve("google-osv-Maven-modified.csv.ts");
         Files.writeString(tempMockCsvTsFile, "2025-10-22T17:35:28Z");
 
         new OsvDownloadTask(mirrorDirPath).inform(new OsvMirrorEvent());
 
+        assertThat(mirrorDirPath.resolve("google-osv-Maven-modified.csv")).exists();
         final List<Vulnerability> vulns = qm.getVulnerabilities().getList(Vulnerability.class);
         assertThat(vulns).hasSize(1);
         final Vulnerability vuln = vulns.getFirst();
@@ -252,8 +253,10 @@ class OsvDownloadTaskTest extends PersistenceCapableTest {
         assertThat(vuln.getCvssV3Vector()).isEqualTo("CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H/E:H");
         assertThat(vuln.getSeverity()).isEqualTo(Severity.CRITICAL);
         assertThat(vuln.getCwes().get(0)).isEqualTo(94);
-
-        System.out.println(vuln.getVulnerableSoftware());
+        assertThat(vuln.getVulnerableSoftware()).hasSize(1);
+        final VulnerableSoftware vs = vuln.getVulnerableSoftware().get(0);
+        assertThat(vs.getPurl()).isEqualTo("pkg:maven/org.richfaces/richfaces-core");
+        assertThat(vs.getVersionEndExcluding()).isEqualTo("3.3.4");
     }
 
     private byte[] zipResources(final String[] resourcePaths) throws Exception {
