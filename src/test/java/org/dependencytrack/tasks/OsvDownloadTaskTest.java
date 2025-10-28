@@ -42,6 +42,8 @@ import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
+import java.time.Clock;
+import java.time.Instant;
 import java.time.LocalDateTime;
 import java.time.ZoneOffset;
 import java.util.List;
@@ -216,7 +218,7 @@ class OsvDownloadTaskTest extends PersistenceCapableTest {
         final Path mirrorDirPath = Files.createTempDirectory(null);
         mirrorDirPath.toFile().deleteOnExit();
 
-        // Create mock .zip file and .ts files to trigger an incremental update
+        // Mock .zip file and .ts files to trigger an incremental update
         final Path tempMockZipFile = mirrorDirPath.resolve("google-osv-Maven.zip");
         Files.writeString(tempMockZipFile, "------fake-zip-data------");
         final Path tempMockZipTsFile = mirrorDirPath.resolve("google-osv-Maven.zip.ts");
@@ -224,7 +226,11 @@ class OsvDownloadTaskTest extends PersistenceCapableTest {
         final Path tempMockCsvTsFile = mirrorDirPath.resolve("google-osv-Maven-modified.csv.ts");
         Files.writeString(tempMockCsvTsFile, "2025-10-22T17:35:28Z");
 
-        new OsvDownloadTask(mirrorDirPath).inform(new OsvMirrorEvent());
+        // Fixed clock for Instant.now() in the OsvDownloadTask, such that the incremental update will be correctly triggered in this test
+        final Instant instant = Instant.parse("2025-10-23T17:00:00Z");
+        final Clock clock = Clock.fixed(instant, ZoneOffset.UTC);
+
+        new OsvDownloadTask(mirrorDirPath, clock).inform(new OsvMirrorEvent());
 
         assertThat(mirrorDirPath.resolve("google-osv-Maven-modified.csv")).exists();
         final List<Vulnerability> vulns = qm.getVulnerabilities().getList(Vulnerability.class);

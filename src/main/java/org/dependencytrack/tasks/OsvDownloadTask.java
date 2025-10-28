@@ -76,6 +76,7 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
+import java.time.Clock;
 import java.time.Duration;
 import java.time.format.DateTimeParseException;
 import java.time.Instant;
@@ -112,21 +113,71 @@ public class OsvDownloadTask implements LoggableSubscriber {
     private static final long MAX_ZIP_BYTES = 750L * 1024 * 1024;
     private static final String OSV_FILENAME_PREFIX = "google-osv-";
     private static final Logger LOGGER = Logger.getLogger(OsvDownloadTask.class);
+    private static final Retry DOWNLOAD_RETRY;
+    private static final Retry REQUEST_RETRY;
     private Set<String> ecosystems;
     private String osvBaseUrl;
     private File outputDir;
+    private final Clock clock;
     private final Path mirrorDirPath;
     private boolean aliasSyncEnabled;
     private long metricParseTime;
     private long metricDownloadTime;
     private boolean mirroredWithoutErrors = true;
 
-    public OsvDownloadTask() {
-        this(DEFAULT_OSV_MIRROR_DIR);
+    static {
+        RetryRegistry registry = RetryRegistry.ofDefaults();
+        final RetryConfig downloadConfig = RetryConfig.custom()
+                .intervalFunction(ofExponentialBackoff(
+                        Duration.ofSeconds(2),
+                        2,
+                        Duration.ofSeconds(32)
+                ))
+                .maxAttempts(6)
+                .retryExceptions(
+                        SocketException.class, SocketTimeoutException.class,
+                        NoRouteToHostException.class, ConnectTimeoutException.class
+                )
+                .build();
+        DOWNLOAD_RETRY = registry.retry("osv-mirror-download", downloadConfig);
+        DOWNLOAD_RETRY.getEventPublisher()
+                .onRetry(event -> LOGGER.warn("Encountered retryable exception; Retries: "
+                        + event.getNumberOfRetryAttempts() + "; Next retry in: "
+                        + event.getWaitInterval().toSeconds() + " s", event.getLastThrowable()))
+                .onError(event -> LOGGER.error("Failed after "
+                        + event.getNumberOfRetryAttempts() + " attempts"));
+
+        final RetryConfig requestConfig = RetryConfig.<CloseableHttpResponse>custom()
+                .intervalFunction(ofExponentialBackoff(
+                        Duration.ofSeconds(2),
+                        2,
+                        Duration.ofSeconds(32)
+                ))
+                .maxAttempts(6)
+                .retryOnResult(response ->
+                        Set.of(403, 408, 429, 502, 503, 504).contains(response.getStatusLine().getStatusCode()))
+                .build();
+        REQUEST_RETRY = registry.retry("osv-mirror-request", requestConfig);
+        REQUEST_RETRY.getEventPublisher()
+                .onRetry(event -> {
+                    LOGGER.warn("Encountered retryable http status code; Retries: " + event.getNumberOfRetryAttempts()
+                            + "; Next retry in: " + event.getWaitInterval().toSeconds() + " s"); // Unfortunately no way to access the response code here
+                })
+                .onError(event -> LOGGER.error("Failed after "
+                        + event.getNumberOfRetryAttempts() + " attempts"));
     }
 
-    OsvDownloadTask(final Path mirrorDirPath) {
+    public OsvDownloadTask() {
+        this(DEFAULT_OSV_MIRROR_DIR, Clock.systemUTC());
+    }
+
+    public OsvDownloadTask(final Path mirrorDirPath) {
+        this(mirrorDirPath, Clock.systemUTC());
+    }
+
+    OsvDownloadTask(final Path mirrorDirPath, Clock clock) {
         this.mirrorDirPath = mirrorDirPath;
+        this.clock = clock;
         try (final QueryManager qm = new QueryManager()) {
             final ConfigProperty enabled = qm.getConfigProperty(
                     VULNERABILITY_SOURCE_GOOGLE_OSV_ENABLED.getGroupName(),
@@ -166,11 +217,9 @@ public class OsvDownloadTask implements LoggableSubscriber {
             setOutputDir(mirrorDirPath.toAbsolutePath().toString());
             ecosystems.forEach(this::processOsvEcosystem);
             final long end = System.currentTimeMillis();
-            LOGGER.info("Google OSV mirroring complete");
-            LOGGER.info("Time spent (d/l):   " + metricDownloadTime + "ms");
-            LOGGER.info("Time spent (parse): " + metricParseTime + "ms");
-            LOGGER.info("Time spent (total): " + (end - start) + "ms");
+            // LOGGER.info("Google OSV mirroring complete");
             if (mirroredWithoutErrors) {
+                LOGGER.info("Google OSV mirroring completed without errors");
                 Notification.dispatch(new Notification()
                         .scope(NotificationScope.SYSTEM)
                         .group(NotificationGroup.DATASOURCE_MIRRORING)
@@ -179,6 +228,7 @@ public class OsvDownloadTask implements LoggableSubscriber {
                         .level(NotificationLevel.INFORMATIONAL)
                 );
             } else {
+                LOGGER.error("Google OSV mirroring completed with errors for one or more selected ecosystems, see above");
                 Notification.dispatch(new Notification()
                         .scope(NotificationScope.SYSTEM)
                         .group(NotificationGroup.DATASOURCE_MIRRORING)
@@ -187,12 +237,15 @@ public class OsvDownloadTask implements LoggableSubscriber {
                         .level(NotificationLevel.ERROR)
                 );
             }
+            LOGGER.info("Time spent (d/l):   " + metricDownloadTime + "ms");
+            LOGGER.info("Time spent (parse): " + metricParseTime + "ms");
+            LOGGER.info("Time spent (total): " + (end - start) + "ms");
         }
     }
 
     private void processOsvEcosystem(String ecosystem) {
         try (var ignoredMdcOsvEcosystem = MDC.putCloseable("osvEcosystem", ecosystem)) {
-            final Instant currentTime = Instant.now();
+            final Instant currentTime = Instant.now(this.clock);
             if (shouldDoIncrementalUpdate(ecosystem, currentTime)) {
                 String url = this.osvBaseUrl
                         + URLEncoder.encode(ecosystem, StandardCharsets.UTF_8).replace("+", "%20")
@@ -226,12 +279,12 @@ public class OsvDownloadTask implements LoggableSubscriber {
             return false; // either timestamp file is not present or timestamp parsing failed
 
         if (currentTime.isBefore(lastFullMirror.plus(5, ChronoUnit.DAYS))) { // full mirror every five days in case any individual advisory files failed to be retrieved
-            LOGGER.info("Last successful full mirror was started at " + lastFullMirror.truncatedTo(ChronoUnit.SECONDS)
-                    + ", performing incremental update for " + ecosystem);
+            LOGGER.info("Last successful full mirror for " + ecosystem + " was started at " + lastFullMirror.truncatedTo(ChronoUnit.SECONDS)
+                    + ", performing incremental update");
             return true;
         } else {
-            LOGGER.info("Last successful full mirror was started at " + lastFullMirror.truncatedTo(ChronoUnit.SECONDS)
-                    + ", performing full update for " + ecosystem);
+            LOGGER.info("Last successful full mirror for " + ecosystem + " was started at " + lastFullMirror.truncatedTo(ChronoUnit.SECONDS)
+                    + ", performing full update");
             return false;
         }
     }
@@ -240,60 +293,30 @@ public class OsvDownloadTask implements LoggableSubscriber {
         File incrementalTimestampFile = new File(outputDir, OSV_FILENAME_PREFIX + ecosystem + "-modified.csv.ts").getAbsoluteFile();
         File fullTimestampFile = new File(outputDir, OSV_FILENAME_PREFIX + ecosystem + ".zip.ts").getAbsoluteFile();
         if (incremental) {
-            Path modifiedCsv = RETRY.executeCheckedSupplier(() -> downloadModifiedCsvFile(url, ecosystem));
+            Path modifiedCsv = DOWNLOAD_RETRY.executeCheckedSupplier(() -> downloadModifiedCsvFile(url, ecosystem));
             LOGGER.debug("Downloaded list of modified OSV advisories for " + ecosystem + " into " + modifiedCsv);
             final boolean success = processModifiedCsvFile(modifiedCsv, ecosystem);
             if (success) {
-                LOGGER.info("Incremental update completed successfully for " + ecosystem);
+                // TODO: if the download of one advisory file failed after 6 attempts, then the timestamp file is still written, check if acceptable
+                LOGGER.info("Incremental update completed for " + ecosystem);
                 writeTimestampFile(incrementalTimestampFile, startTime);
             }
         } else {
-            Path osvZipFile = RETRY.executeCheckedSupplier(() -> downloadOsvZipFile(url, ecosystem));
+            Path osvZipFile = DOWNLOAD_RETRY.executeCheckedSupplier(() -> downloadOsvZipFile(url, ecosystem));
             LOGGER.debug("Downloaded OSV advisories for " + ecosystem + " into " + osvZipFile);
             final boolean success = processOsvZipFile(osvZipFile);
             if (success) {
-                LOGGER.info("Full mirror completed successfully for " + ecosystem);
+                LOGGER.info("Full mirror completed for " + ecosystem);
                 writeTimestampFile(fullTimestampFile, startTime);
                 writeTimestampFile(incrementalTimestampFile, startTime);
             }
         }
     }
 
-    // TODO: align with NistMirrorTask retry config
-    private static final Retry RETRY = createRetryConfig();
-
-    private static Retry createRetryConfig() {
-        RetryConfig config = RetryConfig.custom()
-                .intervalFunction(ofExponentialBackoff(
-                        Duration.ofSeconds(1),
-                        2,
-                        Duration.ofSeconds(32)
-                ))
-                .failAfterMaxAttempts(true)
-                .maxAttempts(6)
-                .retryExceptions(
-                        SocketException.class, SocketTimeoutException.class,
-                        NoRouteToHostException.class, ConnectTimeoutException.class
-                )
-                .ignoreExceptions(IllegalArgumentException.class)
-                .failAfterMaxAttempts(true)
-                .build();
-
-        RetryRegistry registry = RetryRegistry.of(config);
-        Retry retry = registry.retry("osv-mirror");
-
-        retry.getEventPublisher()
-                .onRetry(event -> LOGGER.warn("Encountered retryable exception; Will execute retry " + event.getNumberOfRetryAttempts() + " due to: " + event.getLastThrowable()))
-                .onSuccess(event -> LOGGER.debug("Succeeded after " + event.getNumberOfRetryAttempts() + " attempts"))
-                .onError(event -> LOGGER.error("Failed after " + event.getNumberOfRetryAttempts() + " attempts"));
-
-        return retry;
-    }
-
-    private Path downloadModifiedCsvFile(String url, String ecosystem) throws IOException {
+    private Path downloadModifiedCsvFile(String url, String ecosystem) throws Throwable {
         final long downloadStart = System.currentTimeMillis();
         final HttpUriRequest request = new HttpGet(url);
-        try (CloseableHttpResponse response = HttpClientPool.getClient().execute(request)) {
+        try (CloseableHttpResponse response = REQUEST_RETRY.executeCheckedSupplier(() -> HttpClientPool.getClient().execute(request))) {
             final StatusLine status = response.getStatusLine();
             final HttpEntity entity = response.getEntity();
             try {
@@ -302,7 +325,7 @@ public class OsvDownloadTask implements LoggableSubscriber {
                     LOGGER.error("Download of modified_id.csv failed for: " + ecosystem + " - " +
                             status.getStatusCode() + " " + status.getReasonPhrase());
                     mirroredWithoutErrors = false;
-                    // TODO: handle certain results/status codes in the retry, so they are not skipped here
+                    // TODO: test if the request retry works
                     throw new IOException("Download failed: " + status);
                 }
                 final String fileName = OSV_FILENAME_PREFIX + ecosystem + "-modified.csv";
@@ -349,13 +372,14 @@ public class OsvDownloadTask implements LoggableSubscriber {
                     + "/" + URLEncoder.encode(id, StandardCharsets.UTF_8).replace("+", "%20")
                     + ".json";
             final HttpUriRequest request = new HttpGet(url);
-            try (CloseableHttpResponse response = RETRY.executeCheckedSupplier(() -> HttpClientPool.getClient().execute(request))) {
+            try (CloseableHttpResponse response = REQUEST_RETRY.executeCheckedSupplier(() -> HttpClientPool.getClient().execute(request))) {
                 final StatusLine status = response.getStatusLine();
                 final HttpEntity entity = response.getEntity();
                 try {
-                    // TODO: handle certain results/status codes in the retry, so they are not skipped here
+                    // TODO: Test if the retry works for this, even if the below remains.
+                    // TODO: Think of the possible issues with this approach (if the retries fail for one
                     if (status.getStatusCode() != HttpStatus.SC_OK) {
-                        LOGGER.error("Download of advisory file failed for: " + id + " - " +
+                        LOGGER.error("Download of advisory file failed for: " + url + " - " +
                                 status.getStatusCode() + " " + status.getReasonPhrase());
                         mirroredWithoutErrors = false;
                         continue;
@@ -442,10 +466,10 @@ public class OsvDownloadTask implements LoggableSubscriber {
         }
     }
 
-    private Path downloadOsvZipFile(String url, String ecosystem) throws IOException {
+    private Path downloadOsvZipFile(String url, String ecosystem) throws Throwable {
         final long downloadStart = System.currentTimeMillis();
         final HttpUriRequest request = new HttpGet(url);
-        try (CloseableHttpResponse response = HttpClientPool.getClient().execute(request)) {
+        try (CloseableHttpResponse response = REQUEST_RETRY.executeCheckedSupplier(() -> HttpClientPool.getClient().execute(request))) {
             final StatusLine status = response.getStatusLine();
             final HttpEntity entity = response.getEntity();
             try {
@@ -454,7 +478,7 @@ public class OsvDownloadTask implements LoggableSubscriber {
                     LOGGER.error("Download of all.zip failed for: " + ecosystem + " - " +
                             status.getStatusCode() + " " + status.getReasonPhrase());
                     mirroredWithoutErrors = false;
-                    // TODO: handle certain results/status codes in the retry, so they are not skipped here
+                    // TODO: test if the request retry works
                     throw new IOException("Download failed: " + status);
                 }
                 long contentLength = entity.getContentLength();
