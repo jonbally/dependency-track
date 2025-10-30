@@ -381,7 +381,7 @@ public class OsvDownloadTask implements LoggableSubscriber {
         }
         ArrayList<String> modifiedIds = parseModifiedOsvAdvisoryCsv(modifiedCsvFilePath, lastUpdate);
         if (modifiedIds.isEmpty()) {
-            LOGGER.info("No modified advisories since the last incremental update, skipping");
+            LOGGER.info("No new or modified advisories since the last update, skipping");
             return;
         }
         LOGGER.info("Downloading and processing modified advisories");
@@ -468,8 +468,8 @@ public class OsvDownloadTask implements LoggableSubscriber {
             }
         }
         if (!modifiedIds.isEmpty()) {
-            LOGGER.info("Found " + modifiedIds.size() + " advisories that were modified since the last incremental "
-                    + "update at " + lastUpdate);
+            LOGGER.info("Found " + modifiedIds.size() + " advisories that were added or modified since the last update "
+                    + "at " + lastUpdate);
         }
         metricParseTime += System.currentTimeMillis() - parseStartTime;
         return modifiedIds;
