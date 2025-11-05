@@ -223,10 +223,11 @@ public class OsvDownloadTask implements LoggableSubscriber {
             }
             final long start = System.currentTimeMillis();
             setOutputDir(mirrorDirPath.toAbsolutePath().toString());
+            LOGGER.info("Starting Google OSV mirroring for: " + ecosystems);
             ecosystems.forEach(this::processOsvEcosystem);
             final long end = System.currentTimeMillis();
             if (mirroredWithoutErrors) {
-                LOGGER.info("Google OSV mirroring completed without errors");
+                LOGGER.info("Google OSV mirroring complete");
                 Notification.dispatch(new Notification()
                         .scope(NotificationScope.SYSTEM)
                         .group(NotificationGroup.DATASOURCE_MIRRORING)
@@ -312,7 +313,7 @@ public class OsvDownloadTask implements LoggableSubscriber {
             LOGGER.debug("Downloaded list of modified OSV advisories for " + ecosystem + " into " + modifiedCsv);
             final boolean success = processModifiedCsvFile(modifiedCsv, ecosystem);
             if (success) {
-                // TODO: if the download of one advisory file failed after 6 attempts, then the timestamp file
+                // TODO: if the download of one or more advisory files failed after 6 attempts, then the timestamp file
                 //  is still written, check if acceptable
                 LOGGER.info("Incremental update completed for " + ecosystem);
                 writeTimestampFile(incrementalTimestampFile, startTime);
@@ -366,11 +367,10 @@ public class OsvDownloadTask implements LoggableSubscriber {
             mirroredWithoutErrors = false;
             return false;
         }
-        downloadAndProcessModifiedOsvAdvisories(modifiedCsvFilePath, ecosystem);
-        return true;
+        return downloadAndProcessModifiedOsvAdvisories(modifiedCsvFilePath, ecosystem);
     }
 
-    private void downloadAndProcessModifiedOsvAdvisories(Path modifiedCsvFilePath, String ecosystem) throws IOException {
+    private boolean downloadAndProcessModifiedOsvAdvisories(Path modifiedCsvFilePath, String ecosystem) throws IOException {
         // TODO: add progress logging if modifiedIds is bigger than 500
         Instant lastUpdate = readTimestampFile(modifiedCsvFilePath.getFileName().toString());
         if (lastUpdate == null) {
@@ -382,10 +382,13 @@ public class OsvDownloadTask implements LoggableSubscriber {
         ArrayList<String> modifiedIds = parseModifiedOsvAdvisoryCsv(modifiedCsvFilePath, lastUpdate);
         if (modifiedIds.isEmpty()) {
             LOGGER.info("No new or modified advisories since the last update, skipping");
-            return;
+            return true;
         }
         LOGGER.info("Downloading and processing modified advisories");
         final OsvAdvisoryParser parser = new OsvAdvisoryParser();
+        int count = 0;
+        int lastLoggedPercent = 0;
+        ArrayList<String> unsuccessfulIds = new ArrayList<>();
         for (String id : modifiedIds) {
             final long downloadStartTime = System.currentTimeMillis();
             String url = this.osvBaseUrl
@@ -397,17 +400,17 @@ public class OsvDownloadTask implements LoggableSubscriber {
                 final StatusLine status = response.getStatusLine();
                 final HttpEntity entity = response.getEntity();
                 try {
-                    // TODO: Test if the retry works for this, even if the below remains; tested works. After the
-                    //  retries fail the log below is output and the advisory is skipped.
-                    // TODO: Think of the possible issues with this approach, exceptions and certain HTTP status codes
-                    //  will be retried. Otherwise one HTTP or socket exception will cause the whole incremental update
-                    //  to fail. If the exception occurs 6 times, then the whole incremental update will still fail,
-                    //  but usually they will resolve on the first retry (for e.g. SocketException, SocketTimeOutException)
                     if (status.getStatusCode() != HttpStatus.SC_OK) {
                         LOGGER.error("Download of advisory file failed for: " + url + " - " +
                                 status.getStatusCode() + " " + status.getReasonPhrase());
                         mirroredWithoutErrors = false;
+                        unsuccessfulIds.add(id);
                         continue;
+                    }
+                    if (unsuccessfulIds.size() > 5) {
+                        LOGGER.error("Failed to acquire more than 5 out of " + modifiedIds.size() + " advisories, aborting."
+                                + " IDs that could not be acquired: " + unsuccessfulIds);
+                        return false;
                     }
                     try (final InputStream in = response.getEntity().getContent()) {
                         final BufferedReader reader = new BufferedReader(
@@ -417,6 +420,13 @@ public class OsvDownloadTask implements LoggableSubscriber {
                         metricDownloadTime += downloadEndTime - downloadStartTime;
                         final JSONObject json = new JSONObject(new JSONTokener(reader));
                         processOsvAdvisoryJsonFromCsv(json, parser);
+
+                        if (modifiedIds.size() >= 500) {
+                            // TODO: test this
+                            count++;
+                            final int totalCount = modifiedIds.size() - unsuccessfulIds.size();
+                            lastLoggedPercent = logProgressPercent(count, totalCount, lastLoggedPercent);
+                        }
                         final long parseEndtime = System.currentTimeMillis();
                         metricParseTime += parseEndtime - downloadEndTime;
                     }
@@ -430,6 +440,10 @@ public class OsvDownloadTask implements LoggableSubscriber {
                 mirroredWithoutErrors = false;
             }
         }
+        if (!unsuccessfulIds.isEmpty()) {
+            LOGGER.warn("Advisories with the following IDs could not be acquired: " + unsuccessfulIds);
+        }
+        return true;
     }
 
     private ArrayList<String> parseModifiedOsvAdvisoryCsv(Path modifiedCsvFilePath, Instant lastUpdate) throws IOException {
@@ -569,15 +583,20 @@ public class OsvDownloadTask implements LoggableSubscriber {
                 }
                 processOsvAdvisoryJsonFromZip(zipIn, entryName);
                 count++;
-                final int currentProcessedPercentage = (count * 100) / totalCount;
-                if (currentProcessedPercentage >= lastLoggedPercent + 10) {
-                    LOGGER.info("Processed " + count + "/" + totalCount + " advisories (" + currentProcessedPercentage + "%)");
-                    lastLoggedPercent = currentProcessedPercentage;
-                }
+                lastLoggedPercent = logProgressPercent(count, totalCount, lastLoggedPercent);
             } finally {
                 zipIn.closeEntry();
             }
         }
+    }
+
+    private int logProgressPercent(int currentCount, int totalCount, int lastLoggedPercent) {
+        final int currentProcessedPercentage = (currentCount * 100) / totalCount;
+        if (currentProcessedPercentage >= lastLoggedPercent + 10) {
+            LOGGER.info("Processed " + currentCount + "/" + totalCount + " advisories (" + currentProcessedPercentage + "%)");
+            lastLoggedPercent = currentProcessedPercentage;
+        }
+        return lastLoggedPercent;
     }
 
     private void processOsvAdvisoryJsonFromZip(ZipInputStream zipIn, String entryName) {
