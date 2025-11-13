@@ -166,10 +166,9 @@ public class OsvDownloadTask implements LoggableSubscriber {
                 .build();
         REQUEST_RETRY = registry.retry("osv-mirror-request", requestRetryConfig);
         REQUEST_RETRY.getEventPublisher()
-                .onRetry(event -> {
-                    LOGGER.warn("Encountered retryable http status code; Retries: " + event.getNumberOfRetryAttempts()
-                            + "; Next retry in: " + event.getWaitInterval().toSeconds() + " s");
-                })
+                .onRetry(event -> LOGGER.warn("Encountered retryable http status code; Retries: "
+                        + event.getNumberOfRetryAttempts()
+                        + "; Next retry in: " + event.getWaitInterval().toSeconds() + " s"))
                 .onError(event -> LOGGER.error("Failed after "
                         + event.getNumberOfRetryAttempts() + " attempts"));
     }
