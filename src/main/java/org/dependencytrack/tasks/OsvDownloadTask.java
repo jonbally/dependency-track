@@ -313,8 +313,6 @@ public class OsvDownloadTask implements LoggableSubscriber {
             LOGGER.debug("Downloaded list of modified OSV advisories for " + ecosystem + " into " + modifiedCsv);
             final boolean success = processModifiedCsvFile(modifiedCsv, ecosystem);
             if (success) {
-                // TODO: if the download of one or more advisory files failed after 6 attempts, then the timestamp file
-                //  is still written, check if acceptable
                 LOGGER.info("Incremental update completed for " + ecosystem);
                 writeTimestampFile(incrementalTimestampFile, startTime);
             }
@@ -344,7 +342,8 @@ public class OsvDownloadTask implements LoggableSubscriber {
                             status.getStatusCode() + " " + status.getReasonPhrase());
                     mirroredWithoutErrors = false;
                     // TODO: test if the request retry works
-                    throw new IOException("Download failed: " + status);
+                    // TODO: throw other exception here?
+                    throw new Exception("Download failed: " + status);
                 }
                 final String fileName = OSV_FILENAME_PREFIX + ecosystem + "-modified.csv";
                 final File file = new File(outputDir, fileName).getAbsoluteFile();
@@ -371,7 +370,6 @@ public class OsvDownloadTask implements LoggableSubscriber {
     }
 
     private boolean downloadAndProcessModifiedOsvAdvisories(Path modifiedCsvFilePath, String ecosystem) throws IOException {
-        // TODO: add progress logging if modifiedIds is bigger than 500
         Instant lastUpdate = readTimestampFile(modifiedCsvFilePath.getFileName().toString());
         if (lastUpdate == null) {
             // Should never be reached as the .ts file is already checked in shouldDoIncrementalUpdate()
@@ -379,16 +377,16 @@ public class OsvDownloadTask implements LoggableSubscriber {
                     + " using fallback timestamp");
             lastUpdate = Instant.EPOCH;
         }
-        ArrayList<String> modifiedIds = parseModifiedOsvAdvisoryCsv(modifiedCsvFilePath, lastUpdate);
+        final ArrayList<String> modifiedIds = parseModifiedOsvAdvisoryCsv(modifiedCsvFilePath, lastUpdate);
         if (modifiedIds.isEmpty()) {
             LOGGER.info("No new or modified advisories since the last update, skipping");
             return true;
         }
         LOGGER.info("Downloading and processing modified advisories");
         final OsvAdvisoryParser parser = new OsvAdvisoryParser();
+        final ArrayList<String> unsuccessfulIds = new ArrayList<>();
         int count = 0;
         int lastLoggedPercent = 0;
-        ArrayList<String> unsuccessfulIds = new ArrayList<>();
         for (String id : modifiedIds) {
             final long downloadStartTime = System.currentTimeMillis();
             String url = this.osvBaseUrl
@@ -422,7 +420,6 @@ public class OsvDownloadTask implements LoggableSubscriber {
                         processOsvAdvisoryJsonFromCsv(json, parser);
 
                         if (modifiedIds.size() >= 500) {
-                            // TODO: test this
                             count++;
                             final int totalCount = modifiedIds.size() - unsuccessfulIds.size();
                             lastLoggedPercent = logProgressPercent(count, totalCount, lastLoggedPercent);
@@ -468,10 +465,10 @@ public class OsvDownloadTask implements LoggableSubscriber {
                     if (lastUpdate != null && modifiedTimestamp.isBefore(lastUpdate)) {
                         break;
                     }
-                    // For some ecosystems more than 10k advisories might sometimes be modified within a day.
+                    // For some ecosystems more than 10k advisories (npm sometimes has 40k+) might be modified within a day.
                     // Those mass updates are usually non-critical i.e. versions being added after a new release
                     if (modifiedIds.size() >= 10000) {
-                        LOGGER.warn("Cutting off after 10000 modified advisories, "
+                        LOGGER.warn("Cutting off after 10000 new or modified advisories, "
                                 + "remaining updates will be retrieved in full mirror every 5 days");
                         break;
                     }
@@ -521,7 +518,7 @@ public class OsvDownloadTask implements LoggableSubscriber {
                     // TODO: test if the request retry works
                     throw new IOException("Download failed: " + status);
                 }
-                long contentLength = entity.getContentLength();
+                final long contentLength = entity.getContentLength();
                 LOGGER.debug("HTTP contentLength for " + ecosystem + ": " + contentLength);
                 if (contentLength > MAX_ZIP_BYTES) {
                     LOGGER.error("zip file for " + ecosystem + " is too large: " + contentLength
@@ -566,6 +563,7 @@ public class OsvDownloadTask implements LoggableSubscriber {
 
     private void unzipOsvZipFile(ZipInputStream zipIn, int totalCount) throws IOException {
         final Pattern jsonPattern = Pattern.compile("\\.json$", Pattern.CASE_INSENSITIVE);
+        final OsvAdvisoryParser parser = new OsvAdvisoryParser();
         ZipEntry zipEntry;
         int lastLoggedPercent = 0;
         int count = 0;
@@ -581,7 +579,7 @@ public class OsvDownloadTask implements LoggableSubscriber {
                     LOGGER.warn("Skipped non-JSON entry: " + entryName);
                     continue;
                 }
-                processOsvAdvisoryJsonFromZip(zipIn, entryName);
+                processOsvAdvisoryJsonFromZip(zipIn, entryName, parser);
                 count++;
                 lastLoggedPercent = logProgressPercent(count, totalCount, lastLoggedPercent);
             } finally {
@@ -599,8 +597,7 @@ public class OsvDownloadTask implements LoggableSubscriber {
         return lastLoggedPercent;
     }
 
-    private void processOsvAdvisoryJsonFromZip(ZipInputStream zipIn, String entryName) {
-        final OsvAdvisoryParser parser = new OsvAdvisoryParser();
+    private void processOsvAdvisoryJsonFromZip(ZipInputStream zipIn, String entryName, OsvAdvisoryParser parser) {
         try {
             final BufferedReader reader = new BufferedReader(
                     new InputStreamReader(zipIn, StandardCharsets.UTF_8), 8192
