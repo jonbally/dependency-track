@@ -109,9 +109,9 @@ public class OsvDownloadTask implements LoggableSubscriber {
 
     public static final Path DEFAULT_OSV_MIRROR_DIR = Config.getInstance().getDataDirectorty().toPath()
             .resolve("osv").toAbsolutePath();
-    // Max size for ecosystem zip files: 750 MiB, some ecosystem files might reach this size in a couple of years
+    // Max size for ecosystem zip files: 1 GiB, some ecosystem files might reach this size in a few years
     // (Ubuntu is currently the largest one at ~380 MiB)
-    private static final long MAX_ZIP_BYTES = 750L * 1024 * 1024;
+    private static final long MAX_ZIP_BYTES = 1024 * 1024 * 1024;
     private static final String OSV_FILENAME_PREFIX = "google-osv-";
     private static final Logger LOGGER = Logger.getLogger(OsvDownloadTask.class);
     private static final Retry DOWNLOAD_RETRY;
@@ -160,14 +160,13 @@ public class OsvDownloadTask implements LoggableSubscriber {
                         NoRouteToHostException.class, ConnectTimeoutException.class
                 )
                 .retryOnResult(response ->
-                        // retries for responses according to GCS status code documentation
+                        // retries for response codes according to GCS status code documentation
                         // https://docs.cloud.google.com/storage/docs/json_api/v1/status-codes
                         Set.of(408, 429, 502, 503, 504).contains(response.getStatusLine().getStatusCode()))
                 .build();
         REQUEST_RETRY = registry.retry("osv-mirror-request", requestRetryConfig);
         REQUEST_RETRY.getEventPublisher()
                 .onRetry(event -> {
-                    // Unfortunately resilience4j currently offers no way to access the status code here
                     LOGGER.warn("Encountered retryable http status code; Retries: " + event.getNumberOfRetryAttempts()
                             + "; Next retry in: " + event.getWaitInterval().toSeconds() + " s");
                 })
@@ -273,7 +272,7 @@ public class OsvDownloadTask implements LoggableSubscriber {
         }
     }
 
-    // TODO: think about adding a setting to enable or disable incremental updates and to set the period for full updates
+    // Future improvement: add settings to enable or disable incremental updates and to set the cadence for full updates
     private boolean shouldDoIncrementalUpdate(String ecosystem, Instant currentTime) {
         final String fullMirrorOsvFileName = OSV_FILENAME_PREFIX + ecosystem + ".zip";
         final String modifiedOsvFileName = OSV_FILENAME_PREFIX + ecosystem + "-modified.csv";
@@ -290,7 +289,8 @@ public class OsvDownloadTask implements LoggableSubscriber {
             return false;
 
         if (currentTime.isBefore(lastFullMirror.plus(5, ChronoUnit.DAYS))) {
-            // full mirror every five days in case any individual advisory files failed to be retrieved
+            // full mirror every five days in case any individual advisory files failed to be acquired or were skipped
+            // during an incremental update
             LOGGER.info("Last successful full mirror for " + ecosystem + " was started at "
                     + lastFullMirror.truncatedTo(ChronoUnit.SECONDS)
                     + ", performing incremental update");
@@ -310,7 +310,7 @@ public class OsvDownloadTask implements LoggableSubscriber {
                 + ".zip.ts").getAbsoluteFile();
         if (incremental) {
             Path modifiedCsv = DOWNLOAD_RETRY.executeCheckedSupplier(() -> downloadModifiedCsvFile(url, ecosystem));
-            LOGGER.debug("Downloaded list of modified OSV advisories for " + ecosystem + " into " + modifiedCsv);
+            LOGGER.debug("Downloaded list of new or modified OSV advisories for " + ecosystem + " into " + modifiedCsv);
             final boolean success = processModifiedCsvFile(modifiedCsv, ecosystem);
             if (success) {
                 LOGGER.info("Incremental update completed for " + ecosystem);
@@ -341,8 +341,6 @@ public class OsvDownloadTask implements LoggableSubscriber {
                     LOGGER.error("Download of modified_id.csv failed for: " + ecosystem + " - " +
                             status.getStatusCode() + " " + status.getReasonPhrase());
                     mirroredWithoutErrors = false;
-                    // TODO: test if the request retry works
-                    // TODO: throw other exception here?
                     throw new Exception("Download failed: " + status);
                 }
                 final String fileName = OSV_FILENAME_PREFIX + ecosystem + "-modified.csv";
@@ -382,7 +380,7 @@ public class OsvDownloadTask implements LoggableSubscriber {
             LOGGER.info("No new or modified advisories since the last update, skipping");
             return true;
         }
-        LOGGER.info("Downloading and processing modified advisories");
+        LOGGER.info("Downloading and processing new or modified advisories");
         final OsvAdvisoryParser parser = new OsvAdvisoryParser();
         final ArrayList<String> unsuccessfulIds = new ArrayList<>();
         int count = 0;
@@ -418,7 +416,6 @@ public class OsvDownloadTask implements LoggableSubscriber {
                         metricDownloadTime += downloadEndTime - downloadStartTime;
                         final JSONObject json = new JSONObject(new JSONTokener(reader));
                         processOsvAdvisoryJsonFromCsv(json, parser);
-
                         if (modifiedIds.size() >= 500) {
                             count++;
                             final int totalCount = modifiedIds.size() - unsuccessfulIds.size();
@@ -463,12 +460,14 @@ public class OsvDownloadTask implements LoggableSubscriber {
                 try {
                     Instant modifiedTimestamp = Instant.parse(timestampStr);
                     if (lastUpdate != null && modifiedTimestamp.isBefore(lastUpdate)) {
+                        // found an entry that was before the last update, the list is sorted with new entries at the top
                         break;
                     }
                     // For some ecosystems more than 10k advisories (npm sometimes has 40k+) might be modified within a day.
-                    // Those mass updates are usually non-critical i.e. versions being added after a new release
+                    // Those mass updates are usually non-critical i.e. versions being added after a new release, but
+                    // they might also contain many new "malicious package" notices for npm
                     if (modifiedIds.size() >= 10000) {
-                        LOGGER.warn("Cutting off after 10000 new or modified advisories, "
+                        LOGGER.warn("Cutting off after 10k new or modified advisories, "
                                 + "remaining updates will be retrieved in full mirror every 5 days");
                         break;
                     }
@@ -498,7 +497,7 @@ public class OsvDownloadTask implements LoggableSubscriber {
                 }
             }
         } catch (RuntimeException e) {
-            LOGGER.error("Unexpected error while processing modified OSV advisory: ", e);
+            LOGGER.error("Unexpected error while processing OSV advisory: ", e);
             mirroredWithoutErrors = false;
         }
     }
@@ -515,8 +514,7 @@ public class OsvDownloadTask implements LoggableSubscriber {
                     LOGGER.error("Download of all.zip failed for: " + ecosystem + " - " +
                             status.getStatusCode() + " " + status.getReasonPhrase());
                     mirroredWithoutErrors = false;
-                    // TODO: test if the request retry works
-                    throw new IOException("Download failed: " + status);
+                    throw new Exception("Download failed: " + status);
                 }
                 final long contentLength = entity.getContentLength();
                 LOGGER.debug("HTTP contentLength for " + ecosystem + ": " + contentLength);
@@ -524,7 +522,7 @@ public class OsvDownloadTask implements LoggableSubscriber {
                     LOGGER.error("zip file for " + ecosystem + " is too large: " + contentLength
                             + " bytes (limit " + MAX_ZIP_BYTES + ")");
                     mirroredWithoutErrors = false;
-                    throw new IOException("Download failed, zip file too large: " + entity.getContentLength());
+                    throw new Exception("Download failed, zip file too large: " + entity.getContentLength());
                 }
                 final String fileName = OSV_FILENAME_PREFIX + ecosystem + ".zip";
                 final File file = new File(outputDir, fileName).getAbsoluteFile();
